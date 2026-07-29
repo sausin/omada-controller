@@ -79,8 +79,10 @@ to complete the Omada setup wizard. (HTTP is on `:8088`, HTTPS on `:8043` by def
 | `sudo bash install-raspberrypi.sh` | Install prerequisites, then run the Omada installer |
 | `sudo bash install-raspberrypi.sh -y` | Same, non-interactive (passes `-y` through to `install.sh`) |
 | `sudo bash install-raspberrypi.sh --data-dir /mnt/ssd/omada` | Put Omada's data/logs/work on this path (symlinked in) |
+| `sudo bash install-raspberrypi.sh --fast-start` | Also enable AppCDS faster boot (Java 19+) |
 | `sudo bash install-raspberrypi.sh --deps-only` | Install/verify prerequisites only, then stop |
 | `sudo bash install-raspberrypi.sh --relocate-only --data-dir /mnt/ssd/omada` | Move an **existing** install's data to another disk; no (re)install |
+| `sudo bash install-raspberrypi.sh --optimize-only` | Add AppCDS faster boot to an **existing** install; nothing else |
 | `sudo bash install-raspberrypi.sh init-cluster-mode` | Passed through to TP-Link's installer for cluster setups |
 | `sudo MONGO_VERSION=8.0 bash install-raspberrypi.sh` | Force a MongoDB version/series instead of auto-detecting |
 | `sudo MONGO_SOURCE=apt bash install-raspberrypi.sh` | On a Pi 4/3, use official MongoDB 4.4 instead of the unofficial modern build |
@@ -150,6 +152,32 @@ This stops Omada, moves `data`/`logs`/`work` to the new path, symlinks them, and
 **Uninstall safety.** Because the relocated directories are symlinks, uninstalling (which does `rm -rf /opt/tplink/EAPController`) removes only the links, never your data on the separate disk. The uninstaller prints the external paths it left behind so you can remove them yourself if you want.
 
 Complementary tweaks worth considering: mount the data disk with `noatime`, and keep MongoDB **journaling enabled** (`linux.mongod.nojournal=false`, the default) — it's what protects the database if the Pi loses power, so don't disable it to save writes; move the writes to better storage instead.
+
+---
+
+## Faster startup (AppCDS)
+
+Omada is a large Spring Boot application (~500 jars), so first-boot on a Pi takes several minutes — most of it JVM class loading and Spring context initialization, not something a config flag makes "instant." But there's one lever that helps with **no downside for a controller that runs 24/7 and rarely restarts**: **Application Class-Data Sharing (AppCDS)**.
+
+AppCDS memory-maps a pre-parsed archive of the application's classes, so on each boot the JVM skips re-parsing and re-verifying all those jars (and reads fewer files off the SD card). On Java 19+ it's self-managing via `-XX:+AutoCreateSharedArchive`: the archive is built on the first start, reused on every start after, and regenerated automatically if the classpath changes (e.g. an Omada upgrade).
+
+Crucially, AppCDS has **no steady-state performance penalty**. The usual "fast Java startup" trick — `-XX:TieredStopAtLevel=1` — does: it caps the JIT at the C1 compiler, permanently lowering throughput for the whole uptime. That's the wrong trade for a box that boots rarely and then runs for weeks, so this project uses AppCDS instead.
+
+Enable it at install time with `--fast-start`, or add it to an existing install without reinstalling:
+
+```bash
+sudo bash install-raspberrypi.sh --optimize-only
+```
+
+This appends the AppCDS flags to `control.sh`'s `JAVA_OPTS` (backing up the original as `control.sh.orig-omada-rpi`, idempotent), then restarts once to build the archive under `data/omada-app-cds.jsa` (on your SSD if you relocated data). The build restart itself isn't faster — the boot *after* it is. Because the flags live in `control.sh`, an Omada **upgrade overwrites them**; just re-run `--optimize-only` afterward.
+
+Measure the effect from the log — Spring records its own startup time:
+
+```bash
+grep -iE 'Started .* in .* seconds' /opt/tplink/EAPController/logs/*.log
+```
+
+Realistic expectation: AppCDS trims the class-loading portion (often ~20–40% of it), and moving `data/` to an SSD speeds MongoDB and the archive read — together a meaningful cut, but a big Spring app on a Pi won't become truly instant. Requires Java 19+ (so trixie's OpenJDK 21; on bookworm's OpenJDK 17 the script skips it with a notice).
 
 ---
 

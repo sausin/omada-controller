@@ -50,9 +50,11 @@
 #   sudo bash install-raspberrypi.sh                     # interactive: asks the questions below
 #   sudo bash install-raspberrypi.sh -y                  # non-interactive (needs --data-dir if relocating)
 #   sudo bash install-raspberrypi.sh --data-dir /mnt/ssd/omada   # put data on this path (symlinked)
+#   sudo bash install-raspberrypi.sh --fast-start        # also enable AppCDS faster-boot (Java 19+)
 #   sudo bash install-raspberrypi.sh --deps-only         # install/verify prerequisites only
 #   sudo bash install-raspberrypi.sh --relocate-only --data-dir /mnt/ssd/omada
 #                                                        # move an EXISTING install's data; no (re)install
+#   sudo bash install-raspberrypi.sh --optimize-only     # add AppCDS faster-boot to an EXISTING install
 #   sudo bash install-raspberrypi.sh init-cluster-mode   # passed through to install.sh
 #
 # Overrides (environment variables):
@@ -86,6 +88,8 @@ die(){  echo "${RED}[X]${RST} $*" >&2; exit 1; }
 # --- argument parsing ---------------------------------------------------------
 DEPS_ONLY=0
 RELOCATE_ONLY=0
+OPTIMIZE_ONLY=0
+FAST_START="${FAST_START:-0}"
 ASSUME_YES=0
 DATA_DIR_ARG="${OMADA_DATA_DIR:-}"
 INSTALL_ARGS=()
@@ -93,11 +97,13 @@ while [ $# -gt 0 ]; do
     case "$1" in
         --deps-only)        DEPS_ONLY=1 ;;
         --relocate-only)    RELOCATE_ONLY=1 ;;
+        --fast-start)       FAST_START=1 ;;
+        --optimize-only)    OPTIMIZE_ONLY=1; FAST_START=1 ;;
         --data-dir)         if [ $# -ge 2 ]; then shift; DATA_DIR_ARG="$1"; else warn "--data-dir needs a path"; fi ;;
         --data-dir=*)       DATA_DIR_ARG="${1#*=}" ;;
         -y|-Y)              ASSUME_YES=1; INSTALL_ARGS+=("-y") ;;
         init-cluster-mode)  INSTALL_ARGS+=("init-cluster-mode") ;;
-        -h|--help)          sed -n '3,53p' "$0" | sed 's/^#\s\{0,1\}//'; exit 0 ;;
+        -h|--help)          sed -n '3,72p' "$0" | sed 's/^#\s\{0,1\}//'; exit 0 ;;
         *)                  warn "Unknown argument '$1' ignored." ;;
     esac
     shift
@@ -291,6 +297,12 @@ install_mongodb_apt() {
     apt-get update -y || die "'apt-get update' failed after adding the MongoDB repo (check the key/codename)."
     DEBIAN_FRONTEND=noninteractive apt-get install -y mongodb-org-server \
         || die "Failed to install mongodb-org-server ${MONGO_VERSION}. If this is a Pi 4/3, the CPU can't run 5.0+; use MONGO_SOURCE=themattman (modern) or MONGO_VERSION=4.4."
+
+    # Confirm the binary actually executes on this CPU. On a Pi 5 (ARMv8.2) it does;
+    # an ARMv8.0 board forced onto a 5.0+ package would fail with 'Illegal instruction'
+    # here rather than silently later when Omada tries to start mongod.
+    mongod --version >/dev/null 2>&1 \
+        || die "mongod installed but won't run on this CPU: $(LC_ALL=C mongod --version 2>&1 | head -n1). For an ARMv8.0 board use MONGO_SOURCE=themattman or MONGO_VERSION=4.4."
     ok "Installed: $(mongod --version 2>/dev/null | head -n1)"
 
     # Omada starts and manages its OWN mongod (properties/omada.properties: port
@@ -551,15 +563,71 @@ relocate_omada_data() {
     ok "Relocation complete: Omada now reads/writes under ${DATA_DEST}."
 }
 
+# --- startup optimization (AppCDS) --------------------------------------------
+# Speeds boot by memory-mapping a pre-parsed class-data archive so the JVM skips
+# re-parsing/verifying the ~500 jars each start. Java 19+ self-manages it via
+# AutoCreateSharedArchive (creates on first run, reuses after, regenerates if the
+# classpath changes on upgrade). NO steady-state penalty -- unlike
+# -XX:TieredStopAtLevel=1 -- so it suits a rarely-restarted, long-uptime controller.
+# Implemented by appending flags to control.sh's JAVA_OPTS (backed up; idempotent).
+optimize_startup() {
+    local ctl="${INSTALL_BASE}/bin/control.sh"
+    [ -f "$ctl" ] || { warn "control.sh not found; skipping startup optimization."; return 0; }
+
+    local jmajor
+    jmajor="$(java -version 2>&1 | awk -F'"' '/version/{print $2}' | cut -d. -f1)"
+    if [ -z "$jmajor" ] || [ "$jmajor" -lt 19 ] 2>/dev/null; then
+        warn "Startup optimization needs Java 19+ (AppCDS auto-archive); yours is ${jmajor:-unknown}. Skipping."
+        return 0
+    fi
+
+    if grep -q 'omada-rpi-fast-start' "$ctl"; then
+        ok "Startup optimization already present in control.sh."
+    else
+        cp -a "$ctl" "${ctl}.orig-omada-rpi" || die "Couldn't back up control.sh; aborting optimization."
+        # Append CDS flags immediately after the JAVA_OPTS= line (DATA_DIR is defined
+        # earlier in control.sh, so the archive lands under data/ -> your SSD if relocated).
+        awk '
+          { print }
+          /^JAVA_OPTS=/ && !patched {
+            print "# omada-rpi-fast-start (added by install-raspberrypi.sh): AppCDS class-data sharing"
+            print "JAVA_OPTS=\"${JAVA_OPTS} -XX:+AutoCreateSharedArchive -XX:SharedArchiveFile=${DATA_DIR}/omada-app-cds.jsa\""
+            patched=1
+          }
+        ' "${ctl}.orig-omada-rpi" > "$ctl" || { cp -a "${ctl}.orig-omada-rpi" "$ctl"; die "Failed to patch control.sh."; }
+        grep -q 'omada-rpi-fast-start' "$ctl" || { cp -a "${ctl}.orig-omada-rpi" "$ctl"; die "Patch didn't apply (no JAVA_OPTS line found?); control.sh restored."; }
+        chmod 755 "$ctl"
+        ok "Enabled AppCDS in control.sh (original saved as control.sh.orig-omada-rpi)."
+    fi
+
+    # Restart once so the JVM builds the archive now; the NEXT boot is the fast one.
+    if [ -x "$OMADA_CTL" ] && [ -z "$(pgrep -f com.tplink.smb.omada.starter.OmadaLinuxMain 2>/dev/null)" ]; then
+        info "Note: Omada isn't running; the archive will build on its next start."
+    elif [ -x "$OMADA_CTL" ]; then
+        info "Restarting Omada once to build the class-data archive (this start won't be faster; subsequent boots will)..."
+        "$OMADA_CTL" restart >/dev/null 2>&1 || warn "Restart reported an issue; check the logs."
+    fi
+    ok "Startup optimization enabled. Archive: ${INSTALL_BASE}/data/omada-app-cds.jsa"
+    echo "    Measure boot time from the log: grep -iE 'Started .* in .* seconds' ${INSTALL_BASE}/logs/*.log"
+}
+
 # --- run ----------------------------------------------------------------------
 echo
 info "=== Omada Network Application - Raspberry Pi installer ==="
+
+# --optimize-only: apply the AppCDS startup optimization to an existing install.
+if [ "$OPTIMIZE_ONLY" -eq 1 ]; then
+    [ -d "$INSTALL_BASE" ] || die "Omada is not installed at ${INSTALL_BASE}; nothing to optimize."
+    optimize_startup
+    exit 0
+fi
 
 # --relocate-only: retrofit an existing install; skip deps + (re)install.
 if [ "$RELOCATE_ONLY" -eq 1 ]; then
     readonly_precheck
     resolve_data_dir
     relocate_omada_data
+    [ "$FAST_START" -eq 1 ] && { echo; optimize_startup; }
     echo
     ok "Done. Omada's data now lives under ${DATA_DEST}; only symlinks remain under ${INSTALL_BASE}."
     echo "    You can now re-enable a read-only/overlay root if you wish."
@@ -609,6 +677,13 @@ echo
 if [ "$RELOCATE" -eq 1 ]; then
     echo
     relocate_omada_data
+fi
+
+# Optional AppCDS startup optimization (after relocation, so the archive lands on
+# the chosen disk). Run last so control.sh exists and Omada is up to build it.
+if [ "$FAST_START" -eq 1 ]; then
+    echo
+    optimize_startup
 fi
 
 echo
