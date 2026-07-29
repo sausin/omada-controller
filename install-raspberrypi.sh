@@ -14,13 +14,25 @@
 #
 # What it handles that a plain apt install would get wrong:
 #   * Refuses to run on a 32-bit OS  -> MongoDB ships no 32-bit ARM packages.
-#   * Uses MongoDB's UBUNTU arm64 repo (there are NO official MongoDB arm64
-#     packages under the Debian repo, so a naive "debian bookworm" repo 404s).
-#   * Picks a MongoDB version the CPU can actually run:
-#       - Pi 5 / Cortex-A76 (ARMv8.2, has LSE 'atomics')  -> MongoDB 7.0 (ubuntu jammy)
-#       - Pi 4 / Pi 3 / Cortex-A72/A53 (ARMv8.0, no LSE)  -> MongoDB 4.4 (ubuntu focal)
-#         (MongoDB 5.0+ aborts with "Illegal instruction" on ARMv8.0 cores.)
-#   * Installs the libssl1.1 that MongoDB 4.4 needs but bookworm dropped.
+#   * Installs the MongoDB GPG signing key FIRST, then adds the official Debian
+#     arm64 repo (component 'main'). On Debian 13 (trixie) it points the repo at
+#     the 'bookworm' codename, because MongoDB hasn't published a trixie server
+#     component yet -- the bookworm packages run correctly on trixie.
+#   * Picks a MongoDB source + version the CPU can actually run:
+#       - Pi 5 / Cortex-A76 (ARMv8.2, has LSE 'atomics') -> official apt, MongoDB 8.0
+#       - Pi 4 / Pi 3 / Cortex-A72/A53 (ARMv8.0, no LSE) -> UNOFFICIAL modern MongoDB
+#         (7.0) from themattman/mongodb-raspberrypi-binaries, which is patched to run
+#         on ARMv8.0. Official apt on these boards can only give EOL 4.4 -- available
+#         via MONGO_SOURCE=apt. (Official MongoDB 5.0+ aborts with "Illegal
+#         instruction" on ARMv8.0 cores.)
+#   * Picks the right Java for the OS: openjdk-17 on bullseye/bookworm, openjdk-21
+#     on trixie (Omada needs Java 17+, verified after install), and exports
+#     JAVA_HOME so install.sh's jsvc check stays quiet.
+#   * Installs the runtime libraries the Pi builds need, verified by running mongod:
+#     the Pi 5 apt path uses libssl3 (nothing extra). The Pi 4 themattman builds are
+#     linked against OpenSSL 1.1 and GCC 11+ libstdc++, so on bookworm/trixie the
+#     script auto-installs libssl1.1 (libcrypto.so.1.1) and, if needed, a newer
+#     libstdc++ -- looping until mongod actually executes.
 #   * Disables the redundant system mongod service (Omada runs its own instance
 #     on port 27217 with dbpath data/db, per properties/omada.properties).
 #
@@ -44,12 +56,15 @@
 #   sudo bash install-raspberrypi.sh init-cluster-mode   # passed through to install.sh
 #
 # Overrides (environment variables):
-#   MONGO_VERSION=8.0     Force a MongoDB major version instead of auto-detecting
-#                         (8.0 or 7.0 on a Pi 5; 4.4 is the ceiling on a Pi 4).
-#   JAVA_PKG=...          Override the JDK/JRE package (default openjdk-17-jre-headless).
+#   MONGO_VERSION=x.y     Force a MongoDB version/series instead of auto-detecting
+#                         (Pi 5: 8.0/7.0 via apt; Pi 4: 7.0/6.0 via themattman, or 4.4).
+#   MONGO_SOURCE=apt|themattman   Force the MongoDB source. On a Pi 4, 'apt' means
+#                         official EOL 4.4; 'themattman' means unofficial modern builds.
+#   JAVA_PKG=...          Override the JRE package (else auto: openjdk-21 on trixie,
+#                         openjdk-17 on bookworm/bullseye).
 #   OMADA_DATA_DIR=PATH   Same as --data-dir PATH.
 #
-# Assumes: Raspberry Pi OS / Raspbian (Debian bullseye or bookworm), 64-bit (arm64).
+# Assumes: Raspberry Pi OS / Raspbian (Debian bullseye, bookworm or trixie), 64-bit (arm64).
 # Version-agnostic: works with any Omada Linux tar/gz release (tested against
 # v5.x/v6.x). Run from inside the extracted Omada package directory (next to
 # the stock install.sh).
@@ -128,66 +143,96 @@ else
     info "CPU capability        : ARMv8.0 (no LSE atomics)       -> MongoDB 4.4 only"
 fi
 
-# --- choose MongoDB version ---------------------------------------------------
-if [ -n "${MONGO_VERSION:-}" ]; then
-    info "MongoDB version       : ${MONGO_VERSION} (pinned via MONGO_VERSION env var)"
-elif [ "$CPU_V82" -eq 1 ]; then
-    MONGO_VERSION="7.0"
-    ok "Selected MongoDB ${MONGO_VERSION} for this CPU."
+# --- choose MongoDB source + version ------------------------------------------
+# Pi 5 (ARMv8.2): official MongoDB Debian apt repo, modern (8.0).
+# Pi 4/3 (ARMv8.0): official apt can only run EOL 4.4. The community project
+#   themattman/mongodb-raspberrypi-binaries publishes unofficial *modern* MongoDB
+#   builds patched to run on ARMv8.0, so that's the default here -- override with
+#   MONGO_SOURCE=apt (official EOL 4.4) if you prefer.
+# Env: MONGO_SOURCE=apt|themattman, MONGO_VERSION=<x.y>.
+MONGO_SOURCE="${MONGO_SOURCE:-}"
+if [ "$CPU_V82" -eq 1 ]; then
+    MONGO_SOURCE="${MONGO_SOURCE:-apt}"
+    MONGO_VERSION="${MONGO_VERSION:-8.0}"
+    info "MongoDB               : ${MONGO_VERSION} via official Debian apt repo"
 else
-    MONGO_VERSION="4.4"
-    warn "This CPU (ARMv8.0, e.g. Pi 4/3) cannot run MongoDB 5.0+ -- it would"
-    warn "abort with 'Illegal instruction'. Falling back to MongoDB ${MONGO_VERSION},"
-    warn "the last series that runs on this core. Note: 4.4 is end-of-life upstream."
+    if [ "${MONGO_SOURCE:-}" = "apt" ] || { [ -n "${MONGO_VERSION:-}" ] && [ "${MONGO_VERSION%%.*}" -lt 5 ] 2>/dev/null; }; then
+        MONGO_SOURCE="apt"
+        MONGO_VERSION="4.4"
+        warn "ARMv8.0 CPU + official apt -> MongoDB 4.4 (end-of-life; needs libssl1.1 on"
+        warn "Debian 12/13, handled below but fragile)."
+    else
+        MONGO_SOURCE="themattman"
+        MONGO_VERSION="${MONGO_VERSION:-7.0}"
+        warn "ARMv8.0 CPU (Pi 4/3): official MongoDB 5.0+ won't run here ('Illegal"
+        warn "instruction'). Using UNOFFICIAL modern MongoDB ${MONGO_VERSION}.x binaries from"
+        warn "themattman/mongodb-raspberrypi-binaries (best-effort community builds)."
+        warn "Prefer official EOL 4.4 instead? Re-run with MONGO_SOURCE=apt."
+    fi
 fi
-
 MONGO_MAJOR="${MONGO_VERSION%%.*}"
-if [ "$CPU_V82" -eq 0 ] && [ "${MONGO_MAJOR:-0}" -ge 5 ] 2>/dev/null; then
-    warn "You pinned MongoDB ${MONGO_VERSION}, but this CPU lacks ARMv8.2/LSE."
-    warn "mongod will almost certainly crash with 'Illegal instruction'."
-    warn "Set MONGO_VERSION=4.4 for this board unless you know otherwise."
-fi
 
 # --- helpers ------------------------------------------------------------------
-mongo_repo_suite() {
-    # MongoDB does NOT publish arm64 packages under its Debian repo, so we use
-    # the Ubuntu arm64 repo (installs cleanly on Debian-based Raspberry Pi OS,
-    # since the OpenSSL ABI lines up):
-    #   4.4  -> ubuntu focal  (last series that runs on ARMv8.0; links libssl1.1)
-    #   5.0+ -> ubuntu jammy  (ARMv8.2 required; links libssl3, present on bookworm)
-    case "$1" in
-        4.4) echo "focal" ;;
-        *)   echo "jammy" ;;
+mongo_repo_codename() {
+    # MongoDB's official Debian apt repo DOES ship arm64 packages. The catch on
+    # Debian 13 (trixie): MongoDB has not published a 'trixie' server component
+    # yet (the trixie path only carries mongodb-mongosh), so trixie must point at
+    # the 'bookworm' component -- those server packages run fine on trixie.
+    #   modern (5.0+): bullseye->bullseye, bookworm->bookworm, trixie->bookworm
+    #   legacy (4.4) : lives under 'buster' (and links libssl1.1)
+    local v="$1"
+    if [ "$v" = "4.4" ]; then
+        echo "buster"; return
+    fi
+    case "$OS_CODENAME" in
+        bullseye) echo "bullseye" ;;
+        bookworm) echo "bookworm" ;;
+        trixie)   echo "bookworm" ;;   # trixie server pkgs not published; bookworm works
+        *)        echo "bookworm" ;;   # forward-compatible default
     esac
 }
 
+# Both the official MongoDB 4.4 build AND the themattman modern Pi builds are
+# linked against OpenSSL 1.1 (libcrypto.so.1.1 / libssl.so.1.1). Bullseye still
+# ships libssl1.1; bookworm (12) and trixie (13) dropped it for libssl3 -- so on
+# those we install it back. (The official Pi 5 apt path uses libssl3 and never
+# calls this.) Auto-discovers the newest libssl1.1 arm64 .deb from the pool.
 ensure_libssl11() {
-    # MongoDB 4.4 (focal build) links libssl1.1. Bullseye still ships it, but
-    # bookworm dropped it in favour of libssl3 -- so on bookworm we add it back.
     if dpkg -s libssl1.1 >/dev/null 2>&1; then
-        ok "libssl1.1 already present."
+        ok "libssl1.1 already present (provides libcrypto.so.1.1 + libssl.so.1.1)."
         return 0
     fi
-    info "MongoDB 4.4 needs libssl1.1 (absent on ${OS_CODENAME:-this OS}); installing it..."
+    info "Installing libssl1.1 (provides libcrypto.so.1.1 + libssl.so.1.1)..."
     if apt-get install -y libssl1.1 >/dev/null 2>&1; then
         ok "Installed libssl1.1 from the configured apt sources."
         return 0
     fi
-    # Fallback: Debian buster security pool. The point release (deb10uN) rotates
-    # over time; if this exact file 404s, grab the current libssl1.1 arm64 .deb
-    # from http://security.debian.org/debian-security/pool/updates/main/o/openssl/
-    local deb="libssl1.1_1.1.1n-0+deb10u6_arm64.deb"
-    local url="http://security.debian.org/debian-security/pool/updates/main/o/openssl/${deb}"
-    info "Fetching ${deb} from the Debian buster security archive..."
-    if curl -fsSL -o "/tmp/${deb}" "$url" && dpkg -i "/tmp/${deb}" >/dev/null 2>&1; then
+    # Fallback: newest libssl1.1 arm64 .deb from the Debian security pool.
+    local base="http://security.debian.org/debian-security/pool/updates/main/o/openssl"
+    local deb
+    deb="$(curl -fsSL "${base}/" 2>/dev/null | grep -oE 'libssl1\.1_[^"]+_arm64\.deb' | sort -V | tail -n1)"
+    [ -n "$deb" ] || die "Couldn't find a libssl1.1 arm64 package in the Debian pool. Install libssl1.1 (provides libcrypto.so.1.1) manually, then re-run. Browse: ${base}/"
+    info "Fetching ${deb} from the Debian security pool..."
+    if curl -fSL -o "/tmp/${deb}" "${base}/${deb}"; then
+        dpkg -i "/tmp/${deb}" >/dev/null 2>&1 || apt-get -f install -y >/dev/null 2>&1 || true
         rm -f "/tmp/${deb}"
-        ok "Installed libssl1.1 from the Debian buster archive."
-        return 0
     fi
-    rm -f "/tmp/${deb}"
-    die "Could not install libssl1.1 automatically; MongoDB 4.4 will not start without it.
-      Download a libssl1.1 arm64 .deb (openssl 1.1.1x) and 'dpkg -i' it, then re-run.
-      Browse: http://security.debian.org/debian-security/pool/updates/main/o/openssl/"
+    dpkg -s libssl1.1 >/dev/null 2>&1 \
+        || die "Could not install libssl1.1 automatically (needed for libcrypto.so.1.1). Download a libssl1.1 arm64 .deb and 'dpkg -i' it, then re-run. Browse: ${base}/"
+    ok "Installed libssl1.1 from the Debian security pool."
+}
+
+# Omada needs Java 17+. The right package differs per OS: bookworm/bullseye ship
+# openjdk-17, trixie (Debian 13) ships openjdk-21 (no openjdk-17). Pick the first
+# candidate that apt can actually install, honouring a JAVA_PKG override.
+pick_java_pkg() {
+    if [ -n "${JAVA_PKG:-}" ]; then echo "$JAVA_PKG"; return; fi
+    local c cand
+    for c in openjdk-21-jre-headless openjdk-17-jre-headless default-jre-headless; do
+        cand="$(apt-cache policy "$c" 2>/dev/null | awk '/Candidate:/{print $2}')"
+        if [ -n "$cand" ] && [ "$cand" != "(none)" ]; then echo "$c"; return; fi
+    done
+    echo "default-jre-headless"   # last-resort; OS default JRE (>=17 on supported releases)
 }
 
 # --- install base packages ----------------------------------------------------
@@ -195,7 +240,7 @@ install_base_packages() {
     info "Updating apt package index..."
     apt-get update -y || die "'apt-get update' failed."
 
-    local java_pkg="${JAVA_PKG:-openjdk-17-jre-headless}"
+    local java_pkg; java_pkg="$(pick_java_pkg)"
     info "Installing ${java_pkg}, jsvc, curl, gnupg, ca-certificates..."
     DEBIAN_FRONTEND=noninteractive apt-get install -y \
         "$java_pkg" jsvc curl gnupg ca-certificates \
@@ -204,12 +249,151 @@ install_base_packages() {
     command -v java  >/dev/null 2>&1 || die "java not found after install."
     command -v jsvc  >/dev/null 2>&1 || die "jsvc not found after install."
     command -v curl  >/dev/null 2>&1 || die "curl not found after install."
+
+    # Omada (v5.15.20+) requires Java 17 or newer -- verify the installed JRE.
+    local jmajor
+    jmajor="$(java -version 2>&1 | awk -F'"' '/version/{print $2}' | cut -d. -f1)"
+    if [ -n "$jmajor" ] && [ "$jmajor" -lt 17 ] 2>/dev/null; then
+        die "Installed Java is version ${jmajor}; Omada requires 17+. Set JAVA_PKG to a 17+ JRE."
+    fi
     ok "Java: $(java -version 2>&1 | head -n1)"
     ok "jsvc: $(command -v jsvc)"
     ok "curl: $(command -v curl)"
 }
 
-# --- install MongoDB ----------------------------------------------------------
+# --- install MongoDB (official Debian apt repo) -------------------------------
+install_mongodb_apt() {
+    local codename keyring listfile
+    codename="$(mongo_repo_codename "$MONGO_VERSION")"
+    keyring="/usr/share/keyrings/mongodb-server-${MONGO_VERSION}.gpg"
+    listfile="/etc/apt/sources.list.d/mongodb-org-${MONGO_VERSION}.list"
+    info "Configuring MongoDB ${MONGO_VERSION} apt repo (debian ${codename}, arm64)..."
+
+    # STEP 1: import the signing key FIRST. Without a trusted key the repo's
+    # 'apt-get update' fails with NO_PUBKEY, so this must precede the list file.
+    command -v gpg >/dev/null 2>&1 || die "gpg missing; base packages must install first."
+    install -d -m 0755 /usr/share/keyrings
+    curl -fsSL "https://pgp.mongodb.com/server-${MONGO_VERSION}.asc" \
+        | gpg --dearmor --yes -o "$keyring" \
+        || die "Failed to fetch/dearmor the MongoDB ${MONGO_VERSION} signing key."
+    chmod 0644 "$keyring"
+    [ -s "$keyring" ] || die "MongoDB signing key ${keyring} is empty; aborting."
+    ok "Imported MongoDB ${MONGO_VERSION} signing key -> ${keyring}"
+
+    # STEP 2: add the Debian repo (component 'main'), signed by that key.
+    echo "deb [ signed-by=${keyring} arch=arm64 ] https://repo.mongodb.org/apt/debian ${codename}/mongodb-org/${MONGO_VERSION} main" \
+        > "$listfile"
+    ok "Added repo -> ${listfile}"
+
+    # STEP 3: legacy 4.4 only needs libssl1.1; modern MongoDB uses libssl3.
+    [ "$MONGO_VERSION" = "4.4" ] && ensure_libssl11
+
+    apt-get update -y || die "'apt-get update' failed after adding the MongoDB repo (check the key/codename)."
+    DEBIAN_FRONTEND=noninteractive apt-get install -y mongodb-org-server \
+        || die "Failed to install mongodb-org-server ${MONGO_VERSION}. If this is a Pi 4/3, the CPU can't run 5.0+; use MONGO_SOURCE=themattman (modern) or MONGO_VERSION=4.4."
+    ok "Installed: $(mongod --version 2>/dev/null | head -n1)"
+
+    # Omada starts and manages its OWN mongod (properties/omada.properties: port
+    # 27217, dbpath ../data/db). The distro mongod.service would run a second,
+    # unused instance on 27017 -- disable it to save memory.
+    if systemctl list-unit-files 2>/dev/null | grep -q '^mongod\.service'; then
+        systemctl disable --now mongod >/dev/null 2>&1 || true
+        ok "Disabled the standalone system mongod.service (Omada runs its own)."
+    fi
+}
+
+# The themattman mongod binary is built with GCC 11+ and needs a matching
+# libstdc++ (GLIBCXX_3.4.29+). Bookworm (GCC 12) and trixie ship a new enough
+# one already; older releases (bullseye, GCC 10) do not. This fetches themattman's
+# prebuilt libstdc++ and points the system libstdc++.so.6 at it. A newer libstdc++
+# is backward-compatible, so other software keeps working; the original target is
+# recorded so the uninstaller can restore it.
+install_themattman_libstdcxx() {
+    local api="https://api.github.com/repos/themattman/raspberrypi-binaries/contents/libstdc%2B%2B"
+    info "Looking up a prebuilt libstdc++ (GCC 11+) on GitHub..."
+    local url
+    url="$(curl -fsSL "$api" 2>/dev/null \
+        | grep -oE '"download_url":[[:space:]]*"[^"]*libstdc\+\+\.so\.6\.0\.[0-9]+"' \
+        | sed -E 's/.*"(https[^"]+)"/\1/' | sort -V | tail -n1)"
+    [ -n "$url" ] || die "Couldn't find a prebuilt libstdc++ in themattman/raspberrypi-binaries; install a GCC 11+ libstdc++ manually, then re-run."
+
+    local name="${url##*/}"
+    install -d -m 0755 /usr/local/lib64
+    info "Downloading ${name} ..."
+    curl -fSL -o "/usr/local/lib64/${name}" "$url" || die "Failed to download ${name}."
+    chmod 0755 "/usr/local/lib64/${name}"
+
+    local target="/lib/aarch64-linux-gnu/libstdc++.so.6" orig
+    orig="$(readlink -f "$target" 2>/dev/null)"
+    [ -n "$orig" ] && printf '%s\n' "$orig" > /usr/local/lib64/.omada-libstdcxx-original
+    ln -sf "/usr/local/lib64/${name}" "$target"
+    ldconfig 2>/dev/null || true
+    ok "Installed ${name} and repointed ${target} (original recorded for uninstall)."
+}
+
+# --- install MongoDB (unofficial Pi builds for ARMv8.0 / Pi 4) ----------------
+# Uses themattman/mongodb-raspberrypi-binaries: modern MongoDB compiled to run on
+# the Pi 4's ARMv8.0 CPU (which official 5.0+ refuses). Raw binaries, no apt.
+install_mongodb_themattman() {
+    local series="${1:-7.0}"
+    warn "Installing UNOFFICIAL MongoDB (themattman/mongodb-raspberrypi-binaries)."
+    warn "These are best-effort community builds that run modern MongoDB on ARMv8.0;"
+    warn "they are NOT supported by MongoDB Inc. Review the project before relying on it."
+
+    local repo="themattman/mongodb-raspberrypi-binaries"
+    local api="https://api.github.com/repos/${repo}/releases?per_page=100"
+    local esc="${series//./\\.}"
+    info "Finding the latest ${series}.x Pi build on GitHub..."
+    local url
+    url="$(curl -fsSL "$api" 2>/dev/null \
+        | grep -oE 'https://[^"]+/mongodb\.ce\.pi4\.r'"${esc}"'\.[0-9]+\.tar\.gz' \
+        | head -n1)"
+    [ -n "$url" ] || die "No ${series}.x pi4 build found. See https://github.com/${repo}/releases and set MONGO_VERSION to an available series (e.g. 6.0/7.0), or use MONGO_SOURCE=apt for official 4.4."
+
+    local tgz="/tmp/mongodb-pi.$$.tgz" tmpd="/tmp/mongodb-pi.$$.d"
+    info "Downloading ${url##*/} ..."
+    curl -fSL -o "$tgz" "$url" || die "Download failed: ${url}"
+    mkdir -p "$tmpd"
+    tar xzf "$tgz" -C "$tmpd" || die "Could not extract ${tgz}."
+
+    install -d -m 0755 /usr/local/bin
+    local b f got=0
+    for b in mongod mongos mongosh; do
+        f="$(find "$tmpd" -type f -name "$b" 2>/dev/null | head -n1)"
+        [ -n "$f" ] && { install -m 0755 "$f" "/usr/local/bin/$b"; [ "$b" = mongod ] && got=1; }
+    done
+    rm -rf "$tgz" "$tmpd"
+    [ "$got" -eq 1 ] || die "The downloaded archive had no 'mongod' binary."
+
+    hash -r 2>/dev/null || true
+    command -v mongod >/dev/null 2>&1 || die "mongod not on PATH after install (check /usr/local/bin)."
+
+    # Verify it actually runs, applying library shims as the loader reports them.
+    # The Pi builds can need BOTH a newer libstdc++ (GLIBCXX_3.4.29+, GCC 11) AND
+    # OpenSSL 1.1 (libcrypto.so.1.1) -- and the loader only reports one missing lib
+    # at a time, so we loop: fix whatever the current error names, then re-check.
+    # Bookworm/trixie ship a new-enough libstdc++, but still need libssl1.1 for the
+    # themattman builds. A Pi 5 (official apt path) never gets here.
+    local tries=0 err
+    while ! mongod --version >/dev/null 2>&1; do
+        tries=$((tries + 1))
+        [ "$tries" -gt 4 ] && die "mongod still won't run after library fixes: $(LC_ALL=C mongod --version 2>&1 | head -n1). Check: ldd \$(command -v mongod)"
+        err="$(LC_ALL=C mongod --version 2>&1 || true)"
+        if printf '%s' "$err" | grep -qiE 'GLIBCXX|libstdc\+\+'; then
+            warn "mongod needs a newer libstdc++ than this OS ships; applying the libstdc++ fix..."
+            install_themattman_libstdcxx
+        elif printf '%s' "$err" | grep -qiE 'libcrypto\.so\.1\.1|libssl\.so\.1\.1'; then
+            warn "mongod is linked against OpenSSL 1.1 (libcrypto.so.1.1), absent on this OS..."
+            ensure_libssl11
+        else
+            die "Installed mongod won't execute: $(printf '%s' "$err" | head -n1). Check: ldd \$(command -v mongod)"
+        fi
+    done
+    ok "Installed unofficial $(mongod --version 2>/dev/null | head -n1) -> /usr/local/bin/mongod"
+    # No apt package/service here, so nothing to disable.
+}
+
+# --- install MongoDB (dispatch) -----------------------------------------------
 install_mongodb() {
     if command -v mongod >/dev/null 2>&1; then
         local cur
@@ -217,34 +401,10 @@ install_mongodb() {
         ok "mongod already installed (v${cur}); leaving it as-is."
         return 0
     fi
-
-    local suite; suite="$(mongo_repo_suite "$MONGO_VERSION")"
-    info "Configuring MongoDB ${MONGO_VERSION} apt repo (ubuntu ${suite}, arm64)..."
-
-    install -d -m 0755 /usr/share/keyrings
-    curl -fsSL "https://pgp.mongodb.com/server-${MONGO_VERSION}.asc" \
-        | gpg --dearmor -o "/usr/share/keyrings/mongodb-server-${MONGO_VERSION}.gpg" \
-        || die "Failed to fetch/dearmor the MongoDB ${MONGO_VERSION} signing key."
-    chmod 0644 "/usr/share/keyrings/mongodb-server-${MONGO_VERSION}.gpg"
-
-    # Ubuntu repo uses the 'multiverse' component (Debian repo would use 'main').
-    echo "deb [ signed-by=/usr/share/keyrings/mongodb-server-${MONGO_VERSION}.gpg arch=arm64 ] https://repo.mongodb.org/apt/ubuntu ${suite}/mongodb-org/${MONGO_VERSION} multiverse" \
-        > "/etc/apt/sources.list.d/mongodb-org-${MONGO_VERSION}.list"
-
-    [ "$MONGO_VERSION" = "4.4" ] && ensure_libssl11
-
-    apt-get update -y || die "'apt-get update' failed after adding the MongoDB repo."
-    DEBIAN_FRONTEND=noninteractive apt-get install -y mongodb-org-server \
-        || die "Failed to install mongodb-org-server ${MONGO_VERSION}."
-    ok "Installed: $(mongod --version 2>/dev/null | head -n1)"
-
-    # Omada starts and manages its own mongod (see properties/omada.properties:
-    # port 27217, dbpath ../data/db). The distro's mongod.service would run a
-    # second, unused instance on 27017 -- disable it to save memory.
-    if systemctl list-unit-files 2>/dev/null | grep -q '^mongod\.service'; then
-        systemctl disable --now mongod >/dev/null 2>&1 || true
-        ok "Disabled the standalone system mongod.service (Omada runs its own)."
-    fi
+    case "$MONGO_SOURCE" in
+        themattman) install_mongodb_themattman "$MONGO_VERSION" ;;
+        *)          install_mongodb_apt ;;
+    esac
 }
 
 # --- read-only root pre-check -------------------------------------------------
@@ -430,6 +590,15 @@ fi
 
 [ -f "${SCRIPT_DIR}/install.sh" ] || die \
     "install.sh not found in ${SCRIPT_DIR}. Run this script from inside the extracted Omada package directory."
+
+# Export JAVA_HOME so install.sh's jsvc version-check can locate Java. Without it
+# jsvc prints a harmless-but-alarming "Cannot locate Java Home", fails to read its
+# own version, and creates an unused lib/amd64 symlink. (control.sh passes -home
+# explicitly at start, so this is purely cosmetic -- but the message worries people.)
+if command -v java >/dev/null 2>&1; then
+    export JAVA_HOME="$(dirname "$(dirname "$(readlink -f "$(command -v java)")")")"
+    info "JAVA_HOME=${JAVA_HOME}"
+fi
 
 info "Handing off to the stock Omada installer (install.sh)..."
 echo

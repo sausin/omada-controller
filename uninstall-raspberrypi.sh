@@ -117,6 +117,33 @@ remove_mongodb() {
     ok "Removed MongoDB apt source list(s) and signing keyring(s), if any were present."
     apt-get update -y >/dev/null 2>&1 || true
 
+    # Unofficial themattman binaries (Pi 4 path) live in /usr/local/bin, not apt.
+    local removed_local=0 b
+    for b in mongod mongos mongosh; do
+        if [ -f "/usr/local/bin/$b" ]; then rm -f "/usr/local/bin/$b" && removed_local=1; fi
+    done
+    [ "$removed_local" -eq 1 ] && ok "Removed unofficial MongoDB binaries from /usr/local/bin."
+
+    # If the installer swapped in a newer libstdc++ (older-OS Pi 4 path), restore it.
+    if [ -f /usr/local/lib64/.omada-libstdcxx-original ]; then
+        local orig; orig="$(cat /usr/local/lib64/.omada-libstdcxx-original 2>/dev/null)"
+        if [ -n "$orig" ] && [ -e "$orig" ]; then
+            ln -sf "$orig" /lib/aarch64-linux-gnu/libstdc++.so.6
+            ldconfig 2>/dev/null || true
+            ok "Restored the original system libstdc++.so.6 -> ${orig}"
+        fi
+        rm -f /usr/local/lib64/.omada-libstdcxx-original
+        rm -f /usr/local/lib64/libstdc++.so.6.0.* 2>/dev/null
+    fi
+
+    # libssl1.1 may have been added for MongoDB (4.4 or the themattman Pi 4 builds).
+    # It's a shared library other software could now use, so we LEAVE it (like
+    # curl/gnupg) rather than risk breaking something -- just flag it.
+    if dpkg -s libssl1.1 >/dev/null 2>&1; then
+        warn "Left libssl1.1 installed (added for MongoDB; other packages may use it now)."
+        warn "Remove it yourself with 'sudo apt-get purge libssl1.1' only if nothing else needs it."
+    fi
+
     if [ -d /var/lib/mongodb ]; then
         warn "Left /var/lib/mongodb in place (the *system* MongoDB data dir)."
         warn "Omada uses its own db under ${INSTALLDIR}/data/db (removed with the app)."
@@ -126,12 +153,23 @@ remove_mongodb() {
 
 # --- step 3: remove the Java/jsvc runtime deps the installer added ------------
 remove_deps() {
-    local java_pkg="${JAVA_PKG:-openjdk-17-jre-headless}"
-    warn "Purging ${java_pkg} and jsvc. (curl, gnupg, ca-certificates are kept.)"
-    DEBIAN_FRONTEND=noninteractive apt-get purge -y "$java_pkg" jsvc \
-        || warn "apt purge of ${java_pkg}/jsvc reported issues (may be in use or already absent)."
+    # The installer may have picked openjdk-17 (bookworm/bullseye) or openjdk-21
+    # (trixie), or a JAVA_PKG override. Purge whichever headless JREs are present.
+    local candidates=()
+    [ -n "${JAVA_PKG:-}" ] && candidates+=("$JAVA_PKG")
+    candidates+=("openjdk-21-jre-headless" "openjdk-17-jre-headless" "default-jre-headless")
+
+    local java_pkgs=()
+    local p
+    for p in "${candidates[@]}"; do
+        dpkg -l "$p" 2>/dev/null | grep -q '^ii' && java_pkgs+=("$p")
+    done
+
+    warn "Purging jsvc${java_pkgs:+ and: ${java_pkgs[*]}}. (curl, gnupg, ca-certificates are kept.)"
+    DEBIAN_FRONTEND=noninteractive apt-get purge -y jsvc "${java_pkgs[@]}" \
+        || warn "apt purge of jsvc/JRE reported issues (may be in use or already absent)."
     DEBIAN_FRONTEND=noninteractive apt-get autoremove --purge -y >/dev/null 2>&1 || true
-    ok "Removed ${java_pkg} and jsvc where present."
+    ok "Removed jsvc and the installed JRE where present."
 }
 
 # --- run ----------------------------------------------------------------------
