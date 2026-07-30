@@ -50,12 +50,26 @@
 #   sudo bash install-raspberrypi.sh                     # interactive: asks the questions below
 #   sudo bash install-raspberrypi.sh -y                  # non-interactive (needs --data-dir if relocating)
 #   sudo bash install-raspberrypi.sh --data-dir /mnt/ssd/omada   # put data on this path (symlinked)
+#   sudo bash install-raspberrypi.sh --profile oc200     # size memory to a TP-Link model
 #   sudo bash install-raspberrypi.sh --fast-start        # also enable AppCDS faster-boot (Java 19+)
 #   sudo bash install-raspberrypi.sh --deps-only         # install/verify prerequisites only
 #   sudo bash install-raspberrypi.sh --relocate-only --data-dir /mnt/ssd/omada
 #                                                        # move an EXISTING install's data; no (re)install
 #   sudo bash install-raspberrypi.sh --optimize-only     # add AppCDS faster-boot to an EXISTING install
+#   sudo bash install-raspberrypi.sh --profile-only --profile oc300
+#                                                        # (re)size an EXISTING install's memory
+#   sudo bash install-raspberrypi.sh --verbose           # stream all output instead of the clean checklist
+#
+# Output: quiet by default -- a live checklist on the terminal, everything else to
+#   a log (/var/log/omada-rpi-install.log, or /tmp if that's not writable). On any
+#   failure the last log lines are shown. `--verbose`/-v streams raw output.
 #   sudo bash install-raspberrypi.sh init-cluster-mode   # passed through to install.sh
+#
+# Memory profiles (--profile / interactive prompt): size MongoDB's cache + the JVM
+# heap to a TP-Link controller model. The board's RAM sets the CEILING; you may pick
+# that model or a SMALLER one, never a bigger one than the RAM backs:
+#     nano  (~handful, 1 GB) · oc200 (~130) · oc300 (~700) · oc400 (~1,310, 8 GB)
+#     auto = the ceiling (default) · none = stock, no caps
 #
 # Overrides (environment variables):
 #   MONGO_VERSION=x.y     Force a MongoDB version/series instead of auto-detecting
@@ -65,6 +79,7 @@
 #   JAVA_PKG=...          Override the JRE package (else auto: openjdk-21 on trixie,
 #                         openjdk-17 on bookworm/bullseye).
 #   OMADA_DATA_DIR=PATH   Same as --data-dir PATH.
+#   OMADA_PROFILE=NAME    Same as --profile NAME.  FORCE_PROFILE=1 lifts the ceiling.
 #
 # Assumes: Raspberry Pi OS / Raspbian (Debian bullseye, bookworm or trixie), 64-bit (arm64).
 # Version-agnostic: works with any Omada Linux tar/gz release (tested against
@@ -74,22 +89,105 @@
 
 set -o pipefail
 
-# --- pretty output ------------------------------------------------------------
-if [ -t 1 ]; then
-    RED=$'\e[31m'; GRN=$'\e[32m'; YLW=$'\e[33m'; BLU=$'\e[34m'; RST=$'\e[0m'
+# --- output / TUI -------------------------------------------------------------
+# Quiet by default: noisy work streams to a log; the terminal shows a live
+# checklist. `--verbose` streams everything. Non-TTY prints plain static lines.
+VERBOSE=0
+if [ -t 1 ]; then TTY=1; else TTY=0; fi
+if [ "$TTY" = 1 ]; then
+    RED=$'\e[31m'; GRN=$'\e[32m'; YLW=$'\e[33m'; BLU=$'\e[36m'; DIM=$'\e[2m'; BOLD=$'\e[1m'; RST=$'\e[0m'
 else
-    RED=''; GRN=''; YLW=''; BLU=''; RST=''
+    RED=''; GRN=''; YLW=''; BLU=''; DIM=''; BOLD=''; RST=''
 fi
-info(){ echo "${BLU}[*]${RST} $*"; }
-ok(){   echo "${GRN}[OK]${RST} $*"; }
-warn(){ echo "${YLW}[!]${RST} $*" >&2; }
-die(){  echo "${RED}[X]${RST} $*" >&2; exit 1; }
+case "${LC_ALL:-${LC_CTYPE:-${LANG:-}}}" in
+    *[Uu][Tt][Ff]*) SPIN='⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏'; OKM='✔'; FAILM='✖'; DOTM='•' ;;
+    *)              SPIN='|/-\';         OKM='OK'; FAILM='x'; DOTM='-' ;;
+esac
+
+LOG="${OMADA_LOG:-/var/log/omada-rpi-install.log}"
+( : >"$LOG" ) 2>/dev/null || LOG="/tmp/omada-rpi-install.log"
+( : >"$LOG" ) 2>/dev/null || LOG="/dev/null"
+
+log(){  printf '%s\n' "$*" >>"$LOG" 2>/dev/null || true; }
+say(){  printf '%b\n' "$*"; }                                          # intentional terminal line
+info(){ if [ "$VERBOSE" = 1 ]; then printf '  %s%s%s %s\n' "$BLU" "$DOTM" "$RST" "$*"; else log "[info] $*"; fi; }
+ok(){   if [ "$VERBOSE" = 1 ]; then printf '  %s%s%s %s\n' "$GRN" "$OKM"  "$RST" "$*"; else log "[ok] $*"; fi; }
+warn(){ printf '  %s!%s %s\n' "$YLW" "$RST" "$*" >&2; log "[warn] $*"; }
+die(){  printf '\n  %s%s%s %s\n' "$RED" "$FAILM" "$RST" "$*" >&2; log "[die] $*"; exit 1; }
+
+STEP=0; STEP_TOTAL=0
+_lbl(){ if [ "$STEP_TOTAL" -gt 0 ]; then printf '[%d/%d] %s' "$STEP" "$STEP_TOTAL" "$1"; else printf '%s' "$1"; fi; }
+_clr(){ [ "$TTY" = 1 ] && printf '\r\033[K'; }
+_okline(){   _clr; printf '  %s%s%s %s\n' "$GRN" "$OKM" "$RST" "$1"; }
+_failline(){
+    _clr; printf '  %s%s%s %s\n\n' "$RED" "$FAILM" "$RST" "$1" >&2
+    printf '  %sInstall failed.%s Last lines of the log:\n' "$RED" "$RST" >&2
+    tail -n 20 "$LOG" 2>/dev/null | sed 's/^/      /' >&2
+    printf '  Full log: %s\n\n' "$LOG" >&2
+    exit 1
+}
+_spin(){
+    local pid="$1" label="$2" start="$3" i=0 n f el; n=${#SPIN}
+    while kill -0 "$pid" 2>/dev/null; do
+        f="${SPIN:i++%n:1}"; el=$((SECONDS-start))
+        printf '\r  %s%s%s %s … %02d:%02d ' "$BLU" "$f" "$RST" "$label" $((el/60)) $((el%60))
+        sleep 0.1
+    done
+}
+# run_spin LABEL cmd...  -- long/external step; ALL output to log; spinner on TTY.
+run_spin(){
+    local label="$1"; shift; STEP=$((STEP+1)); local lbl rc; lbl="$(_lbl "$label")"
+    if [ "$VERBOSE" = 1 ]; then say "  ${BLU}${DOTM}${RST} ${lbl} …"; "$@"; rc=$?
+        [ $rc -eq 0 ] && _okline "$lbl" || _failline "$lbl"; return 0; fi
+    if [ "$TTY" != 1 ]; then printf '  %s %s … ' "$DOTM" "$lbl"; "$@" >>"$LOG" 2>&1; rc=$?
+        [ $rc -eq 0 ] && printf 'done\n' || { printf 'FAILED\n'; _failline "$lbl"; }; return 0; fi
+    "$@" >>"$LOG" 2>&1 & local pid=$! start=$SECONDS
+    _spin "$pid" "$lbl" "$start"; wait "$pid"; rc=$?
+    [ $rc -eq 0 ] && _okline "$lbl" || _failline "$lbl"
+}
+# run_task LABEL func  -- fast func that may set globals; foreground (globals kept);
+# stdout -> log (quiet), stderr (warn/die) stays visible.
+run_task(){
+    local label="$1" fn="$2"; STEP=$((STEP+1)); local lbl; lbl="$(_lbl "$label")"
+    if [ "$VERBOSE" = 1 ]; then say "  ${BLU}${DOTM}${RST} ${lbl} …"; "$fn"; _okline "$lbl"; return 0; fi
+    if "$fn" >>"$LOG"; then _okline "$lbl"; else _failline "$lbl"; fi
+}
+render_header(){
+    say ""
+    say "  ${BOLD}${BLU}Omada Controller${RST}${BOLD} · Raspberry Pi setup${RST}"
+    say "  ${DIM}────────────────────────────────────────────${RST}"
+}
+render_context(){
+    printf '  %s%-9s%s %s\n' "$DIM" "Board"   "$RST" "${MODEL:-unknown}"
+    printf '  %s%-9s%s %s (%s)\n' "$DIM" "OS"  "$RST" "${PRETTY_NAME:-unknown}" "${OS_CODENAME:-?}"
+    printf '  %s%-9s%s %s MB  (ceiling: %s)\n' "$DIM" "Memory" "$RST" "${RAM_MB:-?}" "$(ram_ceiling "${RAM_MB:-0}")"
+    if [ "${MONGO_SOURCE:-}" = "themattman" ]; then
+        printf '  %s%-9s%s %s  via  themattman %s(unofficial ARMv8.0 build)%s\n' "$DIM" "MongoDB" "$RST" "${MONGO_VERSION:-?}" "$DIM" "$RST"
+    else
+        printf '  %s%-9s%s %s  via  %s\n' "$DIM" "MongoDB" "$RST" "${MONGO_VERSION:-?}" "${MONGO_SOURCE:-?}"
+    fi
+}
+render_summary(){
+    local ip; ip="$(hostname -I 2>/dev/null | awk '{print $1}')"; [ -n "$ip" ] || ip="<pi-ip>"
+    say ""
+    say "  ${GRN}${OKM} Setup complete${RST}"
+    say "  ${DIM}────────────────────────────────────────────${RST}"
+    printf '  %s%-9s%s sudo tpeap start|stop|status\n' "$DIM" "Manage" "$RST"
+    printf '  %s%-9s%s https://%s:8043\n' "$DIM" "Web UI" "$RST" "$ip"
+    printf '  %s%-9s%s %s\n' "$DIM" "Profile" "$RST" "${PROFILE:-stock}"
+    [ "${RELOCATE:-0}" = 1 ] && printf '  %s%-9s%s %s\n' "$DIM" "Data" "$RST" "$DATA_DEST"
+    printf '  %s%-9s%s %s\n' "$DIM" "Log" "$RST" "$LOG"
+    say ""
+}
 
 # --- argument parsing ---------------------------------------------------------
 DEPS_ONLY=0
 RELOCATE_ONLY=0
 OPTIMIZE_ONLY=0
+PROFILE_ONLY=0
 FAST_START="${FAST_START:-0}"
+PROFILE_ARG="${OMADA_PROFILE:-}"
+NEEDS_RESTART=0
 ASSUME_YES=0
 DATA_DIR_ARG="${OMADA_DATA_DIR:-}"
 INSTALL_ARGS=()
@@ -99,11 +197,16 @@ while [ $# -gt 0 ]; do
         --relocate-only)    RELOCATE_ONLY=1 ;;
         --fast-start)       FAST_START=1 ;;
         --optimize-only)    OPTIMIZE_ONLY=1; FAST_START=1 ;;
+        --profile-only)     PROFILE_ONLY=1 ;;
+        --profile)          if [ $# -ge 2 ]; then shift; PROFILE_ARG="$1"; else warn "--profile needs a value"; fi ;;
+        --profile=*)        PROFILE_ARG="${1#*=}" ;;
         --data-dir)         if [ $# -ge 2 ]; then shift; DATA_DIR_ARG="$1"; else warn "--data-dir needs a path"; fi ;;
         --data-dir=*)       DATA_DIR_ARG="${1#*=}" ;;
+        --verbose|-v)       VERBOSE=1 ;;
+        --quiet|-q)         VERBOSE=0 ;;
         -y|-Y)              ASSUME_YES=1; INSTALL_ARGS+=("-y") ;;
         init-cluster-mode)  INSTALL_ARGS+=("init-cluster-mode") ;;
-        -h|--help)          sed -n '3,72p' "$0" | sed 's/^#\s\{0,1\}//'; exit 0 ;;
+        -h|--help)          sed -n '3,87p' "$0" | sed 's/^#\s\{0,1\}//'; exit 0 ;;
         *)                  warn "Unknown argument '$1' ignored." ;;
     esac
     shift
@@ -149,6 +252,8 @@ else
     info "CPU capability        : ARMv8.0 (no LSE atomics)       -> MongoDB 4.4 only"
 fi
 
+RAM_MB="$(awk '/^MemTotal:/{print int($2/1024)}' /proc/meminfo 2>/dev/null)"; [ -n "$RAM_MB" ] || RAM_MB=0
+
 # --- choose MongoDB source + version ------------------------------------------
 # Pi 5 (ARMv8.2): official MongoDB Debian apt repo, modern (8.0).
 # Pi 4/3 (ARMv8.0): official apt can only run EOL 4.4. The community project
@@ -165,15 +270,11 @@ else
     if [ "${MONGO_SOURCE:-}" = "apt" ] || { [ -n "${MONGO_VERSION:-}" ] && [ "${MONGO_VERSION%%.*}" -lt 5 ] 2>/dev/null; }; then
         MONGO_SOURCE="apt"
         MONGO_VERSION="4.4"
-        warn "ARMv8.0 CPU + official apt -> MongoDB 4.4 (end-of-life; needs libssl1.1 on"
-        warn "Debian 12/13, handled below but fragile)."
+        info "ARMv8.0 CPU + official apt -> MongoDB 4.4 (EOL; needs libssl1.1 on Debian 12/13)."
     else
         MONGO_SOURCE="themattman"
         MONGO_VERSION="${MONGO_VERSION:-7.0}"
-        warn "ARMv8.0 CPU (Pi 4/3): official MongoDB 5.0+ won't run here ('Illegal"
-        warn "instruction'). Using UNOFFICIAL modern MongoDB ${MONGO_VERSION}.x binaries from"
-        warn "themattman/mongodb-raspberrypi-binaries (best-effort community builds)."
-        warn "Prefer official EOL 4.4 instead? Re-run with MONGO_SOURCE=apt."
+        info "ARMv8.0 CPU (Pi 4/3): official 5.0+ won't run; using unofficial themattman ${MONGO_VERSION}.x."
     fi
 fi
 MONGO_MAJOR="${MONGO_VERSION%%.*}"
@@ -458,9 +559,9 @@ readonly_precheck() {
         die "Root filesystem is read-only/overlay. Make it writable, then re-run."
     fi
     if [ "$ASSUME_YES" -eq 0 ]; then
-        echo
-        warn "Installing writes system packages and files to the root filesystem."
-        read -r -p "Is your root filesystem currently READ-ONLY or overlay-protected? (y/N): " ans
+        say ""
+        say "  ${BOLD}Root filesystem${RST} ${DIM}— installation writes to it${RST}"
+        read -r -p "  Is your root read-only / overlay-protected? (y/N): " ans
         case "${ans^^}" in
             Y|YES) readonly_instructions
                    die "Please make the root filesystem writable, then re-run." ;;
@@ -475,12 +576,10 @@ DATA_DEST=""
 resolve_data_dir() {
     local d="$DATA_DIR_ARG"
     if [ -z "$d" ] && [ "$ASSUME_YES" -eq 0 ] && [ "$RELOCATE_ONLY" -eq 0 ]; then
-        echo
-        info "SD cards wear out under MongoDB's constant writes. You can place Omada's"
-        info "writable data (database, logs, work) on another disk or partition -- e.g."
-        info "a USB SSD or a dedicated writable partition -- and this installer will"
-        info "symlink it in. This is also what lets a read-only root keep working."
-        read -r -p "Path to store Omada's data on, or press Enter to keep it under ${INSTALL_BASE}: " d
+        say ""
+        say "  ${BOLD}Data location${RST} ${DIM}— spare the SD card / enable read-only root${RST}"
+        say "  ${DIM}Put the database + logs on a USB SSD or separate partition (symlinked in).${RST}"
+        read -r -p "  Path for Omada data, or Enter to keep it on the SD card: " d
     fi
 
     if [ -z "$d" ]; then
@@ -570,7 +669,7 @@ relocate_omada_data() {
 # classpath changes on upgrade). NO steady-state penalty -- unlike
 # -XX:TieredStopAtLevel=1 -- so it suits a rarely-restarted, long-uptime controller.
 # Implemented by appending flags to control.sh's JAVA_OPTS (backed up; idempotent).
-optimize_startup() {
+optimize_startup_patch() {
     local ctl="${INSTALL_BASE}/bin/control.sh"
     [ -f "$ctl" ] || { warn "control.sh not found; skipping startup optimization."; return 0; }
 
@@ -584,9 +683,9 @@ optimize_startup() {
     if grep -q 'omada-rpi-fast-start' "$ctl"; then
         ok "Startup optimization already present in control.sh."
     else
-        cp -a "$ctl" "${ctl}.orig-omada-rpi" || die "Couldn't back up control.sh; aborting optimization."
-        # Append CDS flags immediately after the JAVA_OPTS= line (DATA_DIR is defined
-        # earlier in control.sh, so the archive lands under data/ -> your SSD if relocated).
+        [ -f "${ctl}.orig-omada-rpi" ] || cp -a "$ctl" "${ctl}.orig-omada-rpi"
+        # Append CDS flags after the first JAVA_OPTS= line (DATA_DIR is defined earlier
+        # in control.sh, so the archive lands under data/ -> your SSD if relocated).
         awk '
           { print }
           /^JAVA_OPTS=/ && !patched {
@@ -594,103 +693,233 @@ optimize_startup() {
             print "JAVA_OPTS=\"${JAVA_OPTS} -XX:+AutoCreateSharedArchive -XX:SharedArchiveFile=${DATA_DIR}/omada-app-cds.jsa\""
             patched=1
           }
-        ' "${ctl}.orig-omada-rpi" > "$ctl" || { cp -a "${ctl}.orig-omada-rpi" "$ctl"; die "Failed to patch control.sh."; }
-        grep -q 'omada-rpi-fast-start' "$ctl" || { cp -a "${ctl}.orig-omada-rpi" "$ctl"; die "Patch didn't apply (no JAVA_OPTS line found?); control.sh restored."; }
+        ' "$ctl" > "${ctl}.tmp" && mv "${ctl}.tmp" "$ctl" || die "Failed to patch control.sh for AppCDS."
+        grep -q 'omada-rpi-fast-start' "$ctl" || die "AppCDS patch didn't apply (no JAVA_OPTS line found?)."
         chmod 755 "$ctl"
         ok "Enabled AppCDS in control.sh (original saved as control.sh.orig-omada-rpi)."
+        echo "      Archive builds on the next start; the boot after that is the fast one."
+        echo "      Measure: grep -iE 'Started .* in .* seconds' ${INSTALL_BASE}/logs/*.log"
+    fi
+    NEEDS_RESTART=1
+}
+
+# --- memory profiles (size to a TP-Link controller model) ---------------------
+# The board's RAM sets the ceiling; the user may pick that model or any SMALLER
+# one, never a bigger one than the RAM backs. Each profile caps MongoDB's cache
+# and the JVM heap, picks a GC, and sets Omada's adoption limit to match.
+# Numbers are sane, margin-included starting points (override via env if needed).
+set_profile_params() {
+    case "$1" in
+      nano)  P_WT="0.25"; P_XMX="512m";  P_XMS="192m";  P_GC=" -XX:+UseSerialGC"; P_MAXDEV=50;   P_LABEL="Nano (~handful of devices; 1 GB board, best-effort)";;
+      oc200) P_WT="0.25"; P_XMX="768m";  P_XMS="256m";  P_GC=" -XX:+UseSerialGC"; P_MAXDEV=130;  P_LABEL="OC200 / OC220 (~130 devices)";;
+      oc300) P_WT="0.5";  P_XMX="1536m"; P_XMS="512m";  P_GC="";                  P_MAXDEV=700;  P_LABEL="OC300 (~700 devices)";;
+      oc400) P_WT="1.0";  P_XMX="3584m"; P_XMS="1024m"; P_GC="";                  P_MAXDEV=1310; P_LABEL="OC400 (~1,310 devices)";;
+      *) return 1;;
+    esac
+    return 0
+}
+profile_rank() { case "$1" in nano) echo 0;; oc200) echo 1;; oc300) echo 2;; oc400) echo 3;; none) echo 9;; *) echo -1;; esac; }
+ram_ceiling() {
+    local mb="$1"
+    if   [ "$mb" -ge 7000 ]; then echo oc400
+    elif [ "$mb" -ge 3600 ]; then echo oc300
+    elif [ "$mb" -ge 1800 ]; then echo oc200
+    else echo nano
+    fi
+}
+
+PROFILE=""   # resolved: nano|oc200|oc300|oc400|none
+resolve_profile() {
+    RAM_MB="$(awk '/^MemTotal:/{print int($2/1024)}' /proc/meminfo 2>/dev/null)"; [ -n "$RAM_MB" ] || RAM_MB=0
+    local ceil crank; ceil="$(ram_ceiling "$RAM_MB")"; crank="$(profile_rank "$ceil")"
+    info "Detected RAM: ${RAM_MB} MB  ->  this board can run up to: ${ceil}"
+
+    local want="${PROFILE_ARG:-}"
+    if [ -n "$want" ]; then
+        want="$(printf '%s' "$want" | tr 'A-Z' 'a-z')"
+        case "$want" in
+          auto) PROFILE="$ceil"; return;;
+          none) PROFILE="none"; return;;
+        esac
+        set_profile_params "$want" || die "Unknown profile '$want' (use: nano|oc200|oc300|oc400|auto|none)."
+        if [ "$(profile_rank "$want")" -gt "$crank" ]; then
+            if [ "${FORCE_PROFILE:-0}" = "1" ]; then
+                warn "FORCE_PROFILE: '${want}' is above this board's ceiling (${ceil}) -- expect swapping/OOM."
+                PROFILE="$want"
+            else
+                die "Profile '${want}' needs more RAM than this board has (ceiling: ${ceil}). Choose ${ceil} or lower, or set FORCE_PROFILE=1 to override."
+            fi
+        else
+            PROFILE="$want"
+        fi
+        return
     fi
 
-    # Restart once so the JVM builds the archive now; the NEXT boot is the fast one.
-    if [ -x "$OMADA_CTL" ] && [ -z "$(pgrep -f com.tplink.smb.omada.starter.OmadaLinuxMain 2>/dev/null)" ]; then
-        info "Note: Omada isn't running; the archive will build on its next start."
-    elif [ -x "$OMADA_CTL" ]; then
-        info "Restarting Omada once to build the class-data archive (this start won't be faster; subsequent boots will)..."
-        "$OMADA_CTL" restart >/dev/null 2>&1 || warn "Restart reported an issue; check the logs."
+    if [ "$ASSUME_YES" -eq 1 ]; then PROFILE="$ceil"; return; fi   # non-interactive default = ceiling
+
+    say ""
+    say "  ${BOLD}Controller size${RST} ${DIM}— sets MongoDB cache + JVM heap${RST}"
+    say "  ${DIM}Your ${RAM_MB} MB board tops out at ${ceil}; pick it or anything smaller.${RST}"
+    local order=(oc400 oc300 oc200 nano) idx=1 p; declare -A MENU
+    for p in "${order[@]}"; do
+        if [ "$(profile_rank "$p")" -le "$crank" ]; then
+            set_profile_params "$p"
+            local tag=""; [ "$p" = "$ceil" ] && tag="   ${GRN}← suggested${RST}"
+            printf "      %s%d)%s %s%s\n" "$BOLD" "$idx" "$RST" "$P_LABEL" "$tag"
+            MENU[$idx]="$p"; idx=$((idx+1))
+        fi
+    done
+    printf "      %s%d)%s Stock ${DIM}(no memory limits)${RST}\n" "$BOLD" "$idx" "$RST"; MENU[$idx]="none"
+    local pick; read -r -p "  Choose [Enter = ${ceil}]: " pick
+    if   [ -z "$pick" ]; then PROFILE="$ceil"
+    elif [ -n "${MENU[$pick]:-}" ]; then PROFILE="${MENU[$pick]}"
+    else warn "Unrecognized choice; using suggested ${ceil}."; PROFILE="$ceil"; fi
+}
+
+apply_profile() {
+    local ctl="${INSTALL_BASE}/bin/control.sh" props="${INSTALL_BASE}/properties/omada.properties"
+    [ -f "$ctl" ]   || { warn "control.sh not found; skipping memory profile."; return 0; }
+    [ -f "$props" ] || { warn "omada.properties not found; skipping memory profile."; return 0; }
+
+    [ -f "${ctl}.orig-omada-rpi" ]   || cp -a "$ctl" "${ctl}.orig-omada-rpi"
+    [ -f "${props}.orig-omada-rpi" ] || cp -a "$props" "${props}.orig-omada-rpi"
+
+    # Reset to a clean baseline every time so re-applying/switching profiles is idempotent:
+    #  - control.sh: strip only our profile block (leave any AppCDS block intact)
+    #  - omada.properties: restore the pristine copy (it only ever holds our edits)
+    sed -i '/# >>> omada-rpi-profile >>>/,/# <<< omada-rpi-profile <<</d' "$ctl"
+    cp -a "${props}.orig-omada-rpi" "$props"
+
+    if [ "$PROFILE" = "none" ]; then
+        chmod 755 "$ctl"; NEEDS_RESTART=1
+        ok "Memory profile: Stock -- reverted MongoDB/JVM caps to TP-Link defaults."
+        return 0
     fi
-    ok "Startup optimization enabled. Archive: ${INSTALL_BASE}/data/omada-app-cds.jsa"
-    echo "    Measure boot time from the log: grep -iE 'Started .* in .* seconds' ${INSTALL_BASE}/logs/*.log"
+    set_profile_params "$PROFILE" || { warn "Unknown profile '$PROFILE'; skipping."; return 0; }
+
+    # 1) MongoDB WiredTiger cache (append/update on the eap.mongod.args line).
+    awk -v c="$P_WT" '
+      /^eap\.mongod\.args=/ {
+        if ($0 ~ /--wiredTigerCacheSizeGB/) sub(/--wiredTigerCacheSizeGB[ ]+[0-9.]+/, "--wiredTigerCacheSizeGB " c)
+        else $0 = $0 " --wiredTigerCacheSizeGB " c
+      }
+      { print }
+    ' "$props" > "${props}.tmp" && mv "${props}.tmp" "$props"
+
+    # 2) Omada adoption cap (soft guardrail matching the chosen model).
+    if grep -q '^max\.device=' "$props"; then
+        sed -i "s/^max\.device=.*/max.device=${P_MAXDEV}/" "$props"
+    else
+        printf '\nmax.device=%s\n' "$P_MAXDEV" >> "$props"
+    fi
+
+    # 3) JVM heap + GC (append after the first JAVA_OPTS= line, wrapped in markers).
+    local jline="JAVA_OPTS=\"\${JAVA_OPTS} -Xms${P_XMS} -Xmx${P_XMX}${P_GC}\""
+    awk -v j="$jline" '
+      { print }
+      /^JAVA_OPTS=/ && !done { print "# >>> omada-rpi-profile >>>"; print j; print "# <<< omada-rpi-profile <<<"; done=1 }
+    ' "$ctl" > "${ctl}.tmp" && mv "${ctl}.tmp" "$ctl"
+    chmod 755 "$ctl"
+
+    NEEDS_RESTART=1
+    ok "Memory profile: ${P_LABEL}"
+    echo "      MongoDB cache: ${P_WT} GB   |   JVM: -Xms${P_XMS} -Xmx${P_XMX}${P_GC:+  (SerialGC)}   |   max.device: ${P_MAXDEV}"
+}
+
+# Restart Omada once to apply pending control.sh / omada.properties changes.
+restart_omada() {
+    [ "$NEEDS_RESTART" -eq 1 ] || return 0
+    [ -x "$OMADA_CTL" ] || return 0
+    if [ -n "$(pgrep -f com.tplink.smb.omada.starter.OmadaLinuxMain 2>/dev/null)" ]; then
+        info "Restarting Omada once to apply the changes..."
+        "$OMADA_CTL" restart >/dev/null 2>&1 || warn "Restart reported an issue; check ${INSTALL_BASE}/logs/."
+    else
+        "$OMADA_CTL" start >/dev/null 2>&1 || true
+    fi
 }
 
 # --- run ----------------------------------------------------------------------
-echo
-info "=== Omada Network Application - Raspberry Pi installer ==="
+render_header
+[ "$TTY" = 1 ] || say "  ${DIM}(non-interactive output; full log: ${LOG})${RST}"
 
 # --optimize-only: apply the AppCDS startup optimization to an existing install.
-if [ "$OPTIMIZE_ONLY" -eq 1 ]; then
+if [ "$OPTIMIZE_ONLY" -eq 1 ] && [ "$PROFILE_ONLY" -eq 0 ]; then
     [ -d "$INSTALL_BASE" ] || die "Omada is not installed at ${INSTALL_BASE}; nothing to optimize."
-    optimize_startup
-    exit 0
+    STEP_TOTAL=2
+    run_task "Enabling AppCDS fast start" optimize_startup_patch
+    run_spin "Restarting controller" restart_omada
+    render_summary; exit 0
+fi
+
+# --profile-only: (re)apply a memory profile to an existing install; no (re)install.
+if [ "$PROFILE_ONLY" -eq 1 ]; then
+    [ -d "$INSTALL_BASE" ] || die "Omada is not installed at ${INSTALL_BASE}; nothing to size."
+    resolve_profile
+    STEP_TOTAL=$(( 2 + FAST_START ))
+    run_task "Applying ${PROFILE} memory profile" apply_profile
+    [ "$FAST_START" -eq 1 ] && run_task "Enabling AppCDS fast start" optimize_startup_patch
+    run_spin "Restarting controller" restart_omada
+    render_summary; exit 0
 fi
 
 # --relocate-only: retrofit an existing install; skip deps + (re)install.
 if [ "$RELOCATE_ONLY" -eq 1 ]; then
     readonly_precheck
     resolve_data_dir
-    relocate_omada_data
-    [ "$FAST_START" -eq 1 ] && { echo; optimize_startup; }
-    echo
-    ok "Done. Omada's data now lives under ${DATA_DEST}; only symlinks remain under ${INSTALL_BASE}."
-    echo "    You can now re-enable a read-only/overlay root if you wish."
+    STEP_TOTAL=$(( 2 + FAST_START ))
+    run_spin "Relocating data to ${DATA_DEST}" relocate_omada_data
+    [ "$FAST_START" -eq 1 ] && run_task "Enabling AppCDS fast start" optimize_startup_patch
+    run_spin "Restarting controller" restart_omada
+    render_summary
+    say "  ${DIM}Data moved; you may now enable a read-only/overlay root (ensure ${DATA_DEST} is in /etc/fstab).${RST}\n"
     exit 0
 fi
 
-# Ask the up-front questions before any long-running work.
+# Full install: show context, gather all answers, then run the work quietly.
+render_context
 readonly_precheck
 resolve_data_dir
+resolve_profile
 
-echo
-install_base_packages
-install_mongodb
-
-echo
-ok "All prerequisites satisfied:"
-echo "      * $(java -version 2>&1 | head -n1)"
-echo "      * jsvc  : $(command -v jsvc)"
-echo "      * curl  : $(command -v curl)"
-echo "      * mongo : $(mongod --version 2>/dev/null | head -n1)"
-echo
+# Run install.sh non-interactively (we've already gathered consent in our own UI).
+STOCK_ARG="-y"
+if [ "${#INSTALL_ARGS[@]}" -gt 0 ]; then
+    for a in "${INSTALL_ARGS[@]}"; do [ "$a" = "init-cluster-mode" ] && STOCK_ARG="init-cluster-mode"; done
+fi
+run_stock_installer(){ cd "${SCRIPT_DIR}" && bash ./install.sh "$STOCK_ARG"; }
 
 if [ "$DEPS_ONLY" -eq 1 ]; then
-    ok "Prerequisite setup complete (--deps-only)."
-    echo "    To install Omada now, run:  sudo bash \"${SCRIPT_DIR}/install.sh\""
+    STEP_TOTAL=2; say ""
+    run_spin "Installing prerequisites (Java, jsvc, curl)" install_base_packages
+    run_spin "Installing MongoDB ${MONGO_VERSION}" install_mongodb
+    say "\n  ${GRN}${OKM} Prerequisites ready.${RST}  Install Omada with: sudo bash \"${SCRIPT_DIR}/install.sh\""
+    say "  ${DIM}Log: ${LOG}${RST}\n"
     exit 0
 fi
 
 [ -f "${SCRIPT_DIR}/install.sh" ] || die \
     "install.sh not found in ${SCRIPT_DIR}. Run this script from inside the extracted Omada package directory."
 
-# Export JAVA_HOME so install.sh's jsvc version-check can locate Java. Without it
-# jsvc prints a harmless-but-alarming "Cannot locate Java Home", fails to read its
-# own version, and creates an unused lib/amd64 symlink. (control.sh passes -home
-# explicitly at start, so this is purely cosmetic -- but the message worries people.)
-if command -v java >/dev/null 2>&1; then
-    export JAVA_HOME="$(dirname "$(dirname "$(readlink -f "$(command -v java)")")")"
-    info "JAVA_HOME=${JAVA_HOME}"
-fi
+# JAVA_HOME so install.sh's jsvc check stays quiet (see notes at that step).
+command -v java >/dev/null 2>&1 && export JAVA_HOME="$(dirname "$(dirname "$(readlink -f "$(command -v java)")")")"
 
-info "Handing off to the stock Omada installer (install.sh)..."
-echo
-( cd "${SCRIPT_DIR}" && bash ./install.sh "${INSTALL_ARGS[@]}" ) || die "Stock install.sh failed."
+STEP_TOTAL=3
+[ "$RELOCATE" = 1 ]   && STEP_TOTAL=$((STEP_TOTAL+1))
+STEP_TOTAL=$((STEP_TOTAL+1))                         # memory profile
+[ "$FAST_START" = 1 ] && STEP_TOTAL=$((STEP_TOTAL+1))
+STEP_TOTAL=$((STEP_TOTAL+1))                         # restart
 
-# Move data/logs/work onto the chosen disk AFTER install created them, then
-# restart Omada on the new path. Leaves only symlinks under /opt/tplink.
-if [ "$RELOCATE" -eq 1 ]; then
-    echo
-    relocate_omada_data
-fi
+say ""
+run_spin "Installing prerequisites (Java, jsvc, curl)"          install_base_packages
+run_spin "Installing MongoDB ${MONGO_VERSION}"                  install_mongodb
+run_spin "Installing Omada controller (first boot ~1-3 min)"    run_stock_installer
+[ "$RELOCATE" = 1 ]   && run_spin "Relocating data to ${DATA_DEST}"   relocate_omada_data
+run_task "Applying ${PROFILE} memory profile"                   apply_profile
+[ "$FAST_START" = 1 ] && run_task "Enabling AppCDS fast start"  optimize_startup_patch
+run_spin "Restarting controller (applies settings)"             restart_omada
 
-# Optional AppCDS startup optimization (after relocation, so the archive lands on
-# the chosen disk). Run last so control.sh exists and Omada is up to build it.
-if [ "$FAST_START" -eq 1 ]; then
-    echo
-    optimize_startup
-fi
-
-echo
-ok "Done. Manage the service with:  sudo tpeap start|stop|status"
-if [ "$RELOCATE" -eq 1 ]; then
-    echo "    Omada's writable data (data/, logs/, work/) now lives under: ${DATA_DEST}"
-    echo "    Only symlinks remain under ${INSTALL_BASE}, so you can now re-enable a"
-    echo "    read-only / overlay root (raspi-config -> Performance Options)."
-    echo "    Confirm ${DATA_DEST} is mounted at boot via /etc/fstab before doing so."
+render_summary
+if [ "$RELOCATE" = 1 ]; then
+    say "  ${DIM}Data is on a separate disk — you can now enable a read-only/overlay root."
+    say "  Ensure ${DATA_DEST} is in /etc/fstab so it mounts before Omada starts.${RST}\n"
 fi
