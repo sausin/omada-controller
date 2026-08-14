@@ -881,12 +881,23 @@ readonly_precheck
 resolve_data_dir
 resolve_profile
 
-# Run install.sh non-interactively (we've already gathered consent in our own UI).
-STOCK_ARG="-y"
+# Run install.sh non-interactively. IMPORTANT: TP-Link's install.sh accepts ONLY
+# no argument (interactive) or "init-cluster-mode" -- ANY other argument, including
+# "-y", makes it print help and exit WITHOUT installing. So we do NOT pass -y; we
+# run it with no argument and answer its y/n prompts by feeding `yes` on stdin.
+STOCK_ARG=""
 if [ "${#INSTALL_ARGS[@]}" -gt 0 ]; then
     for a in "${INSTALL_ARGS[@]}"; do [ "$a" = "init-cluster-mode" ] && STOCK_ARG="init-cluster-mode"; done
 fi
-run_stock_installer(){ cd "${SCRIPT_DIR}" && bash ./install.sh "$STOCK_ARG"; }
+run_stock_installer(){
+    cd "${SCRIPT_DIR}" || return 1
+    local rc
+    set +o pipefail                       # `yes` gets SIGPIPE at the end; don't let it fail the pipe
+    if [ -n "$STOCK_ARG" ]; then yes | bash ./install.sh "$STOCK_ARG"; else yes | bash ./install.sh; fi
+    rc=$?
+    set -o pipefail
+    return "$rc"
+}
 
 if [ "$DEPS_ONLY" -eq 1 ]; then
     STEP_TOTAL=2; say ""
@@ -913,6 +924,9 @@ say ""
 run_spin "Installing prerequisites (Java, jsvc, curl)"          install_base_packages
 run_spin "Installing MongoDB ${MONGO_VERSION}"                  install_mongodb
 run_spin "Installing Omada controller (first boot ~1-3 min)"    run_stock_installer
+# Hard guard: install.sh can exit 0 without installing (e.g. it printed help). Verify
+# the controller actually landed before we try to profile/optimize/restart it.
+[ -x "$OMADA_CTL" ] || die "Omada did not install (${OMADA_CTL} missing). Check ${LOG} for install.sh output near the end."
 [ "$RELOCATE" = 1 ]   && run_spin "Relocating data to ${DATA_DEST}"   relocate_omada_data
 run_task "Applying ${PROFILE} memory profile"                   apply_profile
 [ "$FAST_START" = 1 ] && run_task "Enabling AppCDS fast start"  optimize_startup_patch
