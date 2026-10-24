@@ -60,6 +60,11 @@
 #                                                        # (re)size an EXISTING install's memory
 #   sudo bash install-raspberrypi.sh --verbose           # stream all output instead of the clean checklist
 #
+# Upgrading to a newer Omada release: extract the NEW TP-Link package, copy this
+# script into it, and run from there:
+#   sudo bash install-raspberrypi.sh --upgrade           # snapshot data, swap versions, restore data,
+#                                                        # re-apply profile + AppCDS (add -y to skip the prompt)
+#
 # Output: quiet by default -- a live checklist on the terminal, everything else to
 #   a log (/var/log/omada-rpi-install.log, or /tmp if that's not writable). On any
 #   failure the last log lines are shown. `--verbose`/-v streams raw output.
@@ -80,8 +85,11 @@
 #                         openjdk-17 on bookworm/bullseye).
 #   OMADA_DATA_DIR=PATH   Same as --data-dir PATH.
 #   OMADA_PROFILE=NAME    Same as --profile NAME.  FORCE_PROFILE=1 lifts the ceiling.
+#   OMADA_BACKUP_DIR=PATH Where --upgrade writes its pre-upgrade data snapshot.
+#   LIBSSL11_DEB=PATH|URL A libssl1.1 arm64 .deb to use (Pi 4 on bookworm/trixie/DietPi);
+#                         a libssl1.1_*_arm64.deb next to this script is picked up too.
 #
-# Assumes: Raspberry Pi OS / Raspbian (Debian bullseye, bookworm or trixie), 64-bit (arm64).
+# Assumes: Raspberry Pi OS / Raspbian or DietPi (Debian bullseye, bookworm or trixie), 64-bit (arm64).
 # Version-agnostic: works with any Omada Linux tar/gz release (tested against
 # v5.x/v6.x). Run from inside the extracted Omada package directory (next to
 # the stock install.sh).
@@ -185,6 +193,7 @@ DEPS_ONLY=0
 RELOCATE_ONLY=0
 OPTIMIZE_ONLY=0
 PROFILE_ONLY=0
+UPGRADE=0
 FAST_START="${FAST_START:-0}"
 PROFILE_ARG="${OMADA_PROFILE:-}"
 NEEDS_RESTART=0
@@ -198,6 +207,7 @@ while [ $# -gt 0 ]; do
         --fast-start)       FAST_START=1 ;;
         --optimize-only)    OPTIMIZE_ONLY=1; FAST_START=1 ;;
         --profile-only)     PROFILE_ONLY=1 ;;
+        --upgrade)          UPGRADE=1 ;;
         --profile)          if [ $# -ge 2 ]; then shift; PROFILE_ARG="$1"; else warn "--profile needs a value"; fi ;;
         --profile=*)        PROFILE_ARG="${1#*=}" ;;
         --data-dir)         if [ $# -ge 2 ]; then shift; DATA_DIR_ARG="$1"; else warn "--data-dir needs a path"; fi ;;
@@ -206,7 +216,7 @@ while [ $# -gt 0 ]; do
         --quiet|-q)         VERBOSE=0 ;;
         -y|-Y)              ASSUME_YES=1; INSTALL_ARGS+=("-y") ;;
         init-cluster-mode)  INSTALL_ARGS+=("init-cluster-mode") ;;
-        -h|--help)          sed -n '3,87p' "$0" | sed 's/^#\s\{0,1\}//'; exit 0 ;;
+        -h|--help)          sed -n '5,/^# -----/p' "$0" | sed '$d; s/^#\s\{0,1\}//'; exit 0 ;;
         *)                  warn "Unknown argument '$1' ignored." ;;
     esac
     shift
@@ -301,32 +311,103 @@ mongo_repo_codename() {
 
 # Both the official MongoDB 4.4 build AND the themattman modern Pi builds are
 # linked against OpenSSL 1.1 (libcrypto.so.1.1 / libssl.so.1.1). Bullseye still
-# ships libssl1.1; bookworm (12) and trixie (13) dropped it for libssl3 -- so on
-# those we install it back. (The official Pi 5 apt path uses libssl3 and never
-# calls this.) Auto-discovers the newest libssl1.1 arm64 .deb from the pool.
+# ships libssl1.1; bookworm (12) and trixie (13) -- and DietPi images built on
+# them -- dropped it for libssl3, so on those we install it back. (The official
+# Pi 5 apt path uses libssl3 and never calls this.)
+#
+# libssl1.1 was last shipped by Debian 11 (bullseye), which has reached end of
+# life and moved off the live mirrors and security.debian.org to archive.debian.org.
+# So we look, in order, at:
+#   1. a .deb you supply: LIBSSL11_DEB=/path/or/https-url, or a libssl1.1_*_arm64.deb
+#      sitting next to this script (handy when the Pi has no internet);
+#   2. the configured apt sources (works on bullseye itself);
+#   3. the newest libssl1.1 arm64 .deb across the Debian pools below (archive first);
+#   4. a pinned, known-good build (LIBSSL11_FALLBACK_URL).
+# Every .deb is checked to really be libssl1.1/arm64 before 'dpkg -i'.
+LIBSSL11_POOLS=(
+    "https://archive.debian.org/debian-security/pool/updates/main/o/openssl"
+    "https://archive.debian.org/debian/pool/main/o/openssl"
+    "https://deb.debian.org/debian-security/pool/updates/main/o/openssl"
+    "https://deb.debian.org/debian/pool/main/o/openssl"
+)
+LIBSSL11_FALLBACK_URL="${LIBSSL11_FALLBACK_URL:-https://archive.debian.org/debian/pool/main/o/openssl/libssl1.1_1.1.1w-0+deb11u1_arm64.deb}"
+
+# _libssl11_dpkg_install FILE  -- validate a libssl1.1 arm64 .deb, then install it.
+_libssl11_dpkg_install() {
+    local f="$1" pkg arch
+    pkg="$(dpkg-deb -f "$f" Package 2>/dev/null)"
+    arch="$(dpkg-deb -f "$f" Architecture 2>/dev/null)"
+    if [ "$pkg" != "libssl1.1" ] || [ "$arch" != "arm64" ]; then
+        warn "Ignoring ${f##*/}: not a libssl1.1 arm64 package (got '${pkg:-?}'/'${arch:-?}')."
+        return 1
+    fi
+    dpkg -i "$f" || DEBIAN_FRONTEND=noninteractive apt-get -f install -y || true
+    dpkg -s libssl1.1 >/dev/null 2>&1
+}
+
+# _libssl11_fetch_install URL  -- download a .deb to a temp file and install it.
+_libssl11_fetch_install() {
+    local url="$1" tmp rc=1
+    tmp="$(mktemp /tmp/libssl1.1.XXXXXX.deb)" || return 1
+    info "Fetching ${url} ..."
+    if curl -fSL --retry 3 -o "$tmp" "$url"; then
+        _libssl11_dpkg_install "$tmp" && rc=0
+    else
+        warn "Download failed: ${url}"
+    fi
+    rm -f "$tmp"
+    return "$rc"
+}
+
 ensure_libssl11() {
     if dpkg -s libssl1.1 >/dev/null 2>&1; then
         ok "libssl1.1 already present (provides libcrypto.so.1.1 + libssl.so.1.1)."
         return 0
     fi
     info "Installing libssl1.1 (provides libcrypto.so.1.1 + libssl.so.1.1)..."
-    if apt-get install -y libssl1.1 >/dev/null 2>&1; then
+
+    # 1) A .deb supplied by the user (path or URL), or dropped next to the script.
+    local local_deb="${LIBSSL11_DEB:-}"
+    [ -n "$local_deb" ] || local_deb="$(ls -1 "${SCRIPT_DIR}"/libssl1.1_*_arm64.deb 2>/dev/null | sort -V | tail -n1)"
+    if [ -n "$local_deb" ]; then
+        case "$local_deb" in
+            http://*|https://*) _libssl11_fetch_install "$local_deb" ;;
+            *) info "Using supplied ${local_deb} ..."; _libssl11_dpkg_install "$local_deb" ;;
+        esac && { ok "Installed libssl1.1 from ${local_deb}."; return 0; }
+        warn "Supplied libssl1.1 package didn't install; trying the network sources."
+    fi
+
+    # 2) The configured apt sources (bullseye, or a user-added bullseye archive line).
+    if DEBIAN_FRONTEND=noninteractive apt-get install -y libssl1.1 >/dev/null 2>&1; then
         ok "Installed libssl1.1 from the configured apt sources."
         return 0
     fi
-    # Fallback: newest libssl1.1 arm64 .deb from the Debian security pool.
-    local base="http://security.debian.org/debian-security/pool/updates/main/o/openssl"
-    local deb
-    deb="$(curl -fsSL "${base}/" 2>/dev/null | grep -oE 'libssl1\.1_[^"]+_arm64\.deb' | sort -V | tail -n1)"
-    [ -n "$deb" ] || die "Couldn't find a libssl1.1 arm64 package in the Debian pool. Install libssl1.1 (provides libcrypto.so.1.1) manually, then re-run. Browse: ${base}/"
-    info "Fetching ${deb} from the Debian security pool..."
-    if curl -fSL -o "/tmp/${deb}" "${base}/${deb}"; then
-        dpkg -i "/tmp/${deb}" >/dev/null 2>&1 || apt-get -f install -y >/dev/null 2>&1 || true
-        rm -f "/tmp/${deb}"
+
+    # 3) Newest libssl1.1 arm64 .deb across the Debian pools. Index pages
+    #    URL-encode '+' as %2B, so decode before comparing versions.
+    local pool deb best="" best_url=""
+    for pool in "${LIBSSL11_POOLS[@]}"; do
+        deb="$(curl -fsSL --max-time 30 "${pool}/" 2>/dev/null \
+            | grep -oE 'libssl1\.1_[^"<>/]+_arm64\.deb' | sed 's/%2[Bb]/+/g' | sort -uV | tail -n1)"
+        [ -n "$deb" ] || { info "No libssl1.1 arm64 package listed at ${pool}/"; continue; }
+        if [ "$(printf '%s\n%s\n' "$best" "$deb" | sort -V | tail -n1)" = "$deb" ]; then
+            best="$deb"; best_url="${pool}/${deb}"
+        fi
+    done
+    if [ -n "$best_url" ] && _libssl11_fetch_install "$best_url"; then
+        ok "Installed ${best} from the Debian archive."
+        return 0
     fi
-    dpkg -s libssl1.1 >/dev/null 2>&1 \
-        || die "Could not install libssl1.1 automatically (needed for libcrypto.so.1.1). Download a libssl1.1 arm64 .deb and 'dpkg -i' it, then re-run. Browse: ${base}/"
-    ok "Installed libssl1.1 from the Debian security pool."
+
+    # 4) Pinned known-good build (last bullseye point release).
+    if [ "$LIBSSL11_FALLBACK_URL" != "$best_url" ] && _libssl11_fetch_install "$LIBSSL11_FALLBACK_URL"; then
+        ok "Installed libssl1.1 from ${LIBSSL11_FALLBACK_URL}."
+        return 0
+    fi
+
+    die "Could not install libssl1.1 (needed for libcrypto.so.1.1). Download it on any machine:
+      ${LIBSSL11_FALLBACK_URL}
+    copy it next to this script (or set LIBSSL11_DEB=/path/to/file.deb), then re-run."
 }
 
 # Omada needs Java 17+. The right package differs per OS: bookworm/bullseye ship
@@ -614,13 +695,8 @@ resolve_data_dir() {
     fi
 }
 
-relocate_omada_data() {
-    [ "$RELOCATE" -eq 1 ] || return 0
-    [ -d "$INSTALL_BASE" ] || die "Omada is not installed at ${INSTALL_BASE}; cannot relocate."
-
-    info "Relocating Omada's writable data to ${DATA_DEST} ..."
-
-    # Stop the controller and make sure its embedded mongod is really down first.
+# Stop the controller and make sure its embedded mongod is really down.
+stop_omada() {
     [ -x "$OMADA_CTL" ] && "$OMADA_CTL" stop >/dev/null 2>&1 || true
     local i
     for i in $(seq 1 10); do
@@ -629,6 +705,15 @@ relocate_omada_data() {
     done
     pkill -f "mongod.*27217" >/dev/null 2>&1 || true
     sleep 1
+}
+
+relocate_omada_data() {
+    [ "$RELOCATE" -eq 1 ] || return 0
+    [ -d "$INSTALL_BASE" ] || die "Omada is not installed at ${INSTALL_BASE}; cannot relocate."
+
+    info "Relocating Omada's writable data to ${DATA_DEST} ..."
+
+    stop_omada
 
     local name src dst
     for name in data logs work; do
@@ -838,6 +923,177 @@ restart_omada() {
     fi
 }
 
+# Run install.sh non-interactively. IMPORTANT: TP-Link's install.sh accepts ONLY
+# no argument (interactive) or "init-cluster-mode" -- ANY other argument, including
+# "-y", makes it print help and exit WITHOUT installing. So we do NOT pass -y; we
+# run it with no argument and answer its y/n prompts by feeding `yes` on stdin.
+STOCK_ARG=""
+if [ "${#INSTALL_ARGS[@]}" -gt 0 ]; then
+    for a in "${INSTALL_ARGS[@]}"; do [ "$a" = "init-cluster-mode" ] && STOCK_ARG="init-cluster-mode"; done
+fi
+run_stock_installer(){
+    cd "${SCRIPT_DIR}" || return 1
+    local rc
+    set +o pipefail                       # `yes` gets SIGPIPE at the end; don't let it fail the pipe
+    if [ -n "$STOCK_ARG" ]; then yes | bash ./install.sh "$STOCK_ARG"; else yes | bash ./install.sh; fi
+    rc=$?
+    set -o pipefail
+    return "$rc"
+}
+
+# --- upgrade an existing install to the package this script sits in ----------
+# TP-Link's tar.gz has no in-place upgrade: the supported path is "uninstall the
+# old version, install the new one". Done by hand that loses everything this
+# installer layered on top (relocated data symlinks, memory profile, AppCDS) and
+# trusts the stock uninstaller's database backup. So --upgrade does it safely:
+#   1. records the current setup (relocation, profile, AppCDS) in a staging dir;
+#   2. stops Omada and snapshots data/ to a .tar.gz (the rollback point);
+#   3. moves data/ logs/ work/ out of the install tree (relocated ones are just
+#      unlinked -- the data stays on its disk), so the stock uninstall can't touch them;
+#   4. runs the OLD version's uninstall.sh, then the NEW package's install.sh;
+#   5. stops the fresh install and puts the original data/ logs/ work/ back
+#      (relocated ones as symlinks again), keeping any new top-level entries the
+#      new version created; the new version migrates the database on first start;
+#   6. re-applies the memory profile + AppCDS and starts the controller.
+# If it's interrupted after step 3, re-running --upgrade resumes from the staging
+# dir instead of starting over.
+UPG_STAGE="/opt/tplink/omada-rpi-upgrade"
+OMADA_DB_BACKUP_DIR="/opt/tplink/omada_db_backup"
+UPG_FAST=0
+UPG_SNAPSHOT=""
+
+detect_existing_setup() {
+    grep -q 'omada-rpi-fast-start' "$OMADA_CTL" 2>/dev/null && UPG_FAST=1
+    if [ -z "$PROFILE_ARG" ] && grep -q '# >>> omada-rpi-profile >>>' "$OMADA_CTL" 2>/dev/null; then
+        local xmx p
+        xmx="$(sed -n '/# >>> omada-rpi-profile >>>/,/# <<< omada-rpi-profile <<</p' "$OMADA_CTL" \
+            | grep -oE -- '-Xmx[0-9]+[mMgG]' | head -n1)"
+        for p in nano oc200 oc300 oc400; do
+            set_profile_params "$p" && [ "-Xmx${P_XMX}" = "$xmx" ] && PROFILE_ARG="$p"
+        done
+    fi
+}
+
+# Foreground: pick + check the snapshot location (sets UPG_SNAPSHOT).
+upgrade_prepare_snapshot() {
+    local data; data="$(readlink -f "${INSTALL_BASE}/data")"
+    [ -d "$data" ] || die "No data directory at ${INSTALL_BASE}/data; nothing to upgrade."
+    local dir="${OMADA_BACKUP_DIR:-}"
+    if [ -z "$dir" ]; then
+        if [ -L "${INSTALL_BASE}/data" ]; then dir="$(dirname "$data")/omada-rpi-backups"
+        else dir="/opt/tplink/omada-rpi-backups"; fi
+    fi
+    mkdir -p "$dir" || die "Could not create backup dir ${dir} (set OMADA_BACKUP_DIR)."
+    local need avail
+    need="$(du -sk "$data" 2>/dev/null | awk '{print $1}')"
+    avail="$(df -Pk "$dir" 2>/dev/null | awk 'NR==2{print $4}')"
+    if [ -n "$need" ] && [ -n "$avail" ] && [ "$avail" -lt "$need" ]; then
+        die "Not enough space in ${dir} for a data snapshot (${need} KB needed, ${avail} KB free). Free space or set OMADA_BACKUP_DIR."
+    fi
+    UPG_SNAPSHOT="${dir}/omada-data-$(date +%Y%m%d-%H%M%S).tar.gz"
+}
+
+upgrade_snapshot() {
+    local data; data="$(readlink -f "${INSTALL_BASE}/data")"
+    info "Snapshotting ${data} -> ${UPG_SNAPSHOT} ..."
+    tar -czf "$UPG_SNAPSHOT" -C "$data" . || die "Data snapshot failed; nothing has been changed."
+    ok "Snapshot: ${UPG_SNAPSHOT}"
+}
+
+# Move data/ logs/ work/ (and any earlier stock db backup) out of harm's way.
+upgrade_stage_data() {
+    mkdir -p "$UPG_STAGE" || die "Could not create ${UPG_STAGE}."
+    {
+        printf 'PROFILE_ARG=%q\n' "$PROFILE_ARG"
+        printf 'UPG_FAST=%q\n' "$UPG_FAST"
+        printf 'UPG_SNAPSHOT=%q\n' "$UPG_SNAPSHOT"
+    } > "${UPG_STAGE}/state"
+    local name src
+    for name in data logs work; do
+        src="${INSTALL_BASE}/${name}"
+        if [ -L "$src" ]; then
+            readlink -f "$src" > "${UPG_STAGE}/${name}.link"
+            rm -f "$src"
+            ok "  ${name}/ stays at $(cat "${UPG_STAGE}/${name}.link") (symlink removed for now)"
+        elif [ -d "$src" ]; then
+            mv "$src" "${UPG_STAGE}/${name}" || die "Could not move ${src} to ${UPG_STAGE}."
+            ok "  ${name}/ -> ${UPG_STAGE}/${name}"
+        fi
+        mkdir -p "$src"   # leave an empty dir so the stock uninstaller finds what it expects
+    done
+    if [ -d "$OMADA_DB_BACKUP_DIR" ]; then
+        mv "$OMADA_DB_BACKUP_DIR" "${UPG_STAGE}/omada_db_backup.pre-upgrade"
+    fi
+    : > "${UPG_STAGE}/.staged"
+}
+
+# Put the staged data back under INSTALL_BASE (also used to roll back).
+upgrade_restore_data() {
+    stop_omada
+    local name dst keep e
+    for name in data logs work; do
+        dst="${INSTALL_BASE}/${name}"
+        if [ -f "${UPG_STAGE}/${name}.link" ]; then
+            keep="$(cat "${UPG_STAGE}/${name}.link")"
+        elif [ -d "${UPG_STAGE}/${name}" ]; then
+            keep="${UPG_STAGE}/${name}"
+        else
+            continue
+        fi
+        # Top-level entries the new version created that the old data lacks (never
+        # merge inside an existing dir such as db/ -- that would mix two databases).
+        if [ -d "$dst" ] && [ ! -L "$dst" ]; then
+            for e in "$dst"/* "$dst"/.[!.]*; do
+                [ -e "$e" ] || continue
+                [ -e "${keep}/${e##*/}" ] || cp -a "$e" "${keep}/"
+            done
+        fi
+        rm -rf "$dst"
+        if [ -f "${UPG_STAGE}/${name}.link" ]; then
+            ln -s "$keep" "$dst"; ok "  ${name}/ -> ${keep}"
+        else
+            mv "$keep" "$dst";    ok "  ${name}/ restored"
+        fi
+    done
+    local u="${OMADA_USER:-root}"
+    chown -R "${u}:$(id -gn "$u" 2>/dev/null || echo root)" "${INSTALL_BASE}/data/" 2>/dev/null || true
+    # The fresh install's own db backup is of an empty database; bring back the
+    # one that existed before the upgrade (if any).
+    if [ -d "${UPG_STAGE}/omada_db_backup.pre-upgrade" ]; then
+        rm -rf "$OMADA_DB_BACKUP_DIR"
+        mv "${UPG_STAGE}/omada_db_backup.pre-upgrade" "$OMADA_DB_BACKUP_DIR"
+    fi
+    rm -rf "$UPG_STAGE"
+}
+
+run_stock_uninstaller() {
+    local uninst="${INSTALL_BASE}/uninstall.sh"
+    [ -f "$uninst" ] || { warn "Old uninstall.sh not found at ${uninst}."; return 1; }
+    # Same convention as install.sh: no arguments, answer its prompts with `yes`.
+    set +o pipefail
+    ( cd / && yes | bash "$uninst" )
+    set -o pipefail
+    [ ! -e "$OMADA_CTL" ]
+}
+
+upgrade_omada() {
+    if [ ! -f "${UPG_STAGE}/.staged" ]; then
+        stop_omada
+        upgrade_snapshot
+        upgrade_stage_data
+        if ! run_stock_uninstaller; then
+            warn "The old version didn't uninstall cleanly; putting your data back."
+            upgrade_restore_data
+            die "Upgrade aborted; the old version is untouched. Snapshot: ${UPG_SNAPSHOT}"
+        fi
+    fi
+    if [ ! -x "$OMADA_CTL" ]; then
+        run_stock_installer
+        [ -x "$OMADA_CTL" ] || die "The new version did not install (${OMADA_CTL} missing). Your data is safe in ${UPG_STAGE} (and ${UPG_SNAPSHOT:-the snapshot}); fix the issue and re-run --upgrade to resume."
+    fi
+    upgrade_restore_data
+}
+
 # --- run ----------------------------------------------------------------------
 render_header
 [ "$TTY" = 1 ] || say "  ${DIM}(non-interactive output; full log: ${LOG})${RST}"
@@ -875,29 +1131,62 @@ if [ "$RELOCATE_ONLY" -eq 1 ]; then
     exit 0
 fi
 
+# --upgrade: move an existing install to the Omada version in this package dir.
+if [ "$UPGRADE" -eq 1 ]; then
+    [ -f "${SCRIPT_DIR}/install.sh" ] || die \
+        "install.sh not found in ${SCRIPT_DIR}. Run --upgrade from inside the NEW extracted Omada package directory."
+    RESUME=0
+    if [ -f "${UPG_STAGE}/.staged" ]; then
+        # shellcheck disable=SC1091
+        . "${UPG_STAGE}/state"
+        RESUME=1
+    else
+        [ -x "$OMADA_CTL" ] || die "No existing install at ${INSTALL_BASE}; run a normal install instead."
+        detect_existing_setup
+        upgrade_prepare_snapshot
+    fi
+    [ "$UPG_FAST" = 1 ] && FAST_START=1
+    render_context
+    printf '  %s%-9s%s %s\n' "$DIM" "Upgrade" "$RST" "${SCRIPT_DIR##*/}"
+    [ "$RESUME" = 1 ] && warn "Resuming an interrupted upgrade (your data is staged in ${UPG_STAGE})."
+    readonly_precheck
+    if [ "$ASSUME_YES" -eq 0 ] && [ "$RESUME" = 0 ]; then
+        say ""
+        say "  ${BOLD}Upgrade${RST} ${DIM}— replaces the installed controller with this package${RST}"
+        say "  ${DIM}Your data is snapshotted to ${UPG_SNAPSHOT} first.${RST}"
+        read -r -p "  Continue? (y/N): " ans
+        case "${ans^^}" in Y|YES) : ;; *) die "Upgrade cancelled; nothing changed." ;; esac
+    fi
+    # Keep the memory profile that was applied before (or the one asked for);
+    # an install that ran stock stays stock.
+    if [ -n "$PROFILE_ARG" ]; then resolve_profile; else PROFILE="none"; fi
+    command -v java >/dev/null 2>&1 && export JAVA_HOME="$(dirname "$(dirname "$(readlink -f "$(command -v java)")")")"
+
+    NEEDS_RESTART=1
+    STEP_TOTAL=$(( 4 + FAST_START ))
+    [ -n "$PROFILE_ARG" ] && STEP_TOTAL=$((STEP_TOTAL+1))
+    say ""
+    run_spin "Installing prerequisites (Java, jsvc, curl)"         install_base_packages
+    run_spin "Installing MongoDB ${MONGO_VERSION}"                 install_mongodb
+    if [ "$RESUME" = 1 ]; then
+        run_spin "Finishing upgrade (install + restore data)"      upgrade_omada
+    else
+        run_spin "Upgrading Omada (snapshot, reinstall, restore data)" upgrade_omada
+    fi
+    [ -n "$PROFILE_ARG" ] && run_task "Applying ${PROFILE} memory profile" apply_profile
+    [ "$FAST_START" = 1 ] && run_task "Enabling AppCDS fast start" optimize_startup_patch
+    run_spin "Starting controller (migrates the database)"        restart_omada
+    render_summary
+    [ -n "${UPG_SNAPSHOT:-}" ] && say "  ${DIM}Pre-upgrade snapshot: ${UPG_SNAPSHOT}"
+    say "  First start after an upgrade migrates the database and can take several minutes.${RST}\n"
+    exit 0
+fi
+
 # Full install: show context, gather all answers, then run the work quietly.
 render_context
 readonly_precheck
 resolve_data_dir
 resolve_profile
-
-# Run install.sh non-interactively. IMPORTANT: TP-Link's install.sh accepts ONLY
-# no argument (interactive) or "init-cluster-mode" -- ANY other argument, including
-# "-y", makes it print help and exit WITHOUT installing. So we do NOT pass -y; we
-# run it with no argument and answer its y/n prompts by feeding `yes` on stdin.
-STOCK_ARG=""
-if [ "${#INSTALL_ARGS[@]}" -gt 0 ]; then
-    for a in "${INSTALL_ARGS[@]}"; do [ "$a" = "init-cluster-mode" ] && STOCK_ARG="init-cluster-mode"; done
-fi
-run_stock_installer(){
-    cd "${SCRIPT_DIR}" || return 1
-    local rc
-    set +o pipefail                       # `yes` gets SIGPIPE at the end; don't let it fail the pipe
-    if [ -n "$STOCK_ARG" ]; then yes | bash ./install.sh "$STOCK_ARG"; else yes | bash ./install.sh; fi
-    rc=$?
-    set -o pipefail
-    return "$rc"
-}
 
 if [ "$DEPS_ONLY" -eq 1 ]; then
     STEP_TOTAL=2; say ""

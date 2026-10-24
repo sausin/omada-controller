@@ -15,7 +15,7 @@ The Omada Linux package is architecture-neutral **Java** — it will run on ARM 
 - **MongoDB on ARM is version-locked to the CPU.** Starting with MongoDB 5.0, `mongod` requires the **ARMv8.2-A** microarchitecture. A Raspberry Pi 4 (and earlier) is only ARMv8.0-A, so official MongoDB 5.0+ crashes immediately with `Illegal instruction (core dumped)`. A Pi 5 runs modern MongoDB natively; a Pi 4 needs either EOL MongoDB 4.4 or the unofficial patched builds described below.
 - **The MongoDB apt repo has correct package names but non-obvious codenames.** The GPG signing key must be imported *before* the repo, or `apt-get update` fails with `NO_PUBKEY`. The official **Debian** repo does carry `arm64` packages — but on **Debian 13 "trixie"** you must point the repo at the **`bookworm`** codename, because MongoDB has not published a trixie server component yet (its trixie path only has the shell). The bookworm packages run fine on trixie.
 - **Java differs by release.** Omada needs Java 17+. Bookworm/bullseye ship `openjdk-17`; **trixie ships `openjdk-21`** (no 17). The installer picks the right one automatically.
-- **`libssl1.1` is gone on modern OSes, and the Pi 4 builds still need it.** The official Pi 5 packages use `libssl3` (shipped by bookworm/trixie). But *both* legacy MongoDB 4.4 **and** the unofficial themattman Pi 4 builds are linked against **OpenSSL 1.1** (`libcrypto.so.1.1`), which bookworm/trixie dropped — so on a Pi 4 the installer adds `libssl1.1` back automatically. The Pi 4 builds may also need a newer `libstdc++` (GCC 11+); the installer handles that too, verifying by actually running `mongod`.
+- **`libssl1.1` is gone on modern OSes, and the Pi 4 builds still need it.** The official Pi 5 packages use `libssl3` (shipped by bookworm/trixie). But *both* legacy MongoDB 4.4 **and** the unofficial themattman Pi 4 builds are linked against **OpenSSL 1.1** (`libcrypto.so.1.1`), which bookworm/trixie (and DietPi images built on them) dropped — so on a Pi 4 the installer adds `libssl1.1` back automatically. The last distro to ship it, Debian 11 *bullseye*, is end-of-life and has moved to `archive.debian.org`, so that's where the installer fetches it from (see [libssl1.1 details](#libssl11-on-bookworm--trixie--dietpi-pi-4)). The Pi 4 builds may also need a newer `libstdc++` (GCC 11+); the installer handles that too, verifying by actually running `mongod`.
 - **32-bit ARM has no MongoDB at all.** There are no modern MongoDB builds for `armhf`, so a 32-bit Raspberry Pi OS simply cannot run Omada.
 
 The installer detects your board's CPU capability and OS, then selects and installs the right MongoDB source and version — so you don't have to reverse-engineer any of the above.
@@ -33,7 +33,7 @@ The installer detects your board's CPU capability and OS, then selects and insta
 
 **Requirements**
 
-- Raspberry Pi OS / Raspbian, **64-bit** (Debian *bullseye*, *bookworm*, or *trixie*). Check with `uname -m` → must be `aarch64`.
+- Raspberry Pi OS / Raspbian or **DietPi**, **64-bit** (Debian *bullseye*, *bookworm*, or *trixie* based). Check with `uname -m` → must be `aarch64`.
 - Root access (`sudo`).
 - Internet access (to fetch packages).
 
@@ -83,16 +83,88 @@ to complete the Omada setup wizard. (HTTP is on `:8088`, HTTPS on `:8043` by def
 | `sudo bash install-raspberrypi.sh --deps-only` | Install/verify prerequisites only, then stop |
 | `sudo bash install-raspberrypi.sh --relocate-only --data-dir /mnt/ssd/omada` | Move an **existing** install's data to another disk; no (re)install |
 | `sudo bash install-raspberrypi.sh --optimize-only` | Add AppCDS faster boot to an **existing** install; nothing else |
+| `sudo bash install-raspberrypi.sh --upgrade` | Upgrade an **existing** install to the Omada version of the package this script is in — see [Upgrading Omada](#upgrading-omada-to-a-newer-release) |
 | `sudo bash install-raspberrypi.sh init-cluster-mode` | Passed through to TP-Link's installer for cluster setups |
 | `sudo MONGO_VERSION=8.0 bash install-raspberrypi.sh` | Force a MongoDB version/series instead of auto-detecting |
 | `sudo MONGO_SOURCE=apt bash install-raspberrypi.sh` | On a Pi 4/3, use official MongoDB 4.4 instead of the unofficial modern build |
 | `sudo JAVA_PKG=openjdk-21-jre-headless bash install-raspberrypi.sh` | Force a specific JRE package |
+| `sudo LIBSSL11_DEB=/path/libssl1.1_…_arm64.deb bash install-raspberrypi.sh` | Use a `libssl1.1` package you downloaded yourself (Pi 4/3; also picked up automatically if the `.deb` sits next to the script) |
 
 Run interactively (no flags) and the script asks two questions before doing any work: whether your root filesystem is read-only, and where to store Omada's data. See [SD-card longevity & read-only root](#sd-card-longevity--read-only-root).
 
 **MongoDB source/version selection.** By default: a **Pi 5** (ARMv8.2) gets **MongoDB 8.0** from the official Debian apt repo; a **Pi 4/3** (ARMv8.0) gets **MongoDB 7.0** from the unofficial [themattman](https://github.com/themattman/mongodb-raspberrypi-binaries) builds (since official 5.0+ won't run on that CPU). Override with `MONGO_VERSION=` (e.g. `7.0` on a Pi 5, `6.0` on a Pi 4) and `MONGO_SOURCE=apt|themattman`. On a Pi 4, `MONGO_SOURCE=apt` gives official EOL 4.4.
 
 **Java selection.** Auto-picked per OS: `openjdk-17-jre-headless` on bookworm/bullseye, `openjdk-21-jre-headless` on trixie. Override with `JAVA_PKG=`. The script verifies the installed JRE is 17+ (Omada's minimum) before continuing.
+
+---
+
+## Upgrading Omada to a newer release
+
+TP-Link ships new Omada Network Application releases (formerly *Omada SDN Controller*) as a fresh Linux `.tar.gz`. There's no in-place updater for the tar.gz install: TP-Link's supported path is *uninstall the old version, install the new one, let it migrate the database*. Doing that by hand on a Pi set up with this project would also throw away what the installer layered on top — the relocated `data`/`logs`/`work` symlinks, the memory profile and AppCDS — and leave you trusting the stock uninstaller's database backup. `--upgrade` does the whole thing safely in one command.
+
+### Before you start
+
+1. **Take a backup in the web UI**: *Settings → Maintenance → Backup & Restore → Backup*, and download the `.cfg` file to another machine. This is TP-Link's own, version-independent backup and the best way back if anything goes wrong.
+2. **Read the release notes** for the version you're moving to on [TP-Link's download page](https://www.tp-link.com/support/download/omada-software-controller/). In particular:
+   - **Upgrade path.** Small jumps (e.g. 5.14 → 5.15, 5.15 → 6.x) are fine. For big jumps from old versions (e.g. 3.x/4.x → 5.x or later), TP-Link sometimes requires an intermediate version first — follow what the notes say.
+   - **Java / MongoDB requirements.** Omada 5.15.20+ needs Java 17+ (this installer already provides 17 or 21); MongoDB is supported up to 8.0. If a future release raises either minimum, upgrade that first.
+   - **Downgrades aren't supported.** The new version migrates the database on first start and the old version can't read it afterwards — that's what the snapshot below is for.
+3. **Make the root filesystem writable** if you use the read-only / overlay root (the upgrade writes to `/opt/tplink`). Re-enable it afterwards.
+
+### Upgrade (recommended)
+
+```bash
+# 1. Get the new Linux package from TP-Link onto the Pi and extract it
+tar -xzf Omada_Network_Application_v<NEW>_linux_x64.tar.gz
+cd Omada_Network_Application_v<NEW>_linux_x64
+
+# 2. Put this repo's scripts next to the NEW install.sh (pull this repo first for the latest fixes)
+cp /path/to/omada-raspberrypi/install-raspberrypi.sh   .
+cp /path/to/omada-raspberrypi/uninstall-raspberrypi.sh .
+
+# 3. Upgrade (add -y to skip the confirmation prompt)
+sudo bash install-raspberrypi.sh --upgrade
+```
+
+What `--upgrade` does:
+
+1. **Records your current setup** — relocated data paths, the memory profile in use, whether AppCDS is on.
+2. **Stops Omada and snapshots `data/`** (the database, keystore and autobackups) to `omada-data-<timestamp>.tar.gz` in `/opt/tplink/omada-rpi-backups/`, or next to your relocated data (`<data-disk>/omada-rpi-backups/`). Set `OMADA_BACKUP_DIR=` to put it elsewhere. It checks there's enough free space first.
+3. **Moves `data/`, `logs/` and `work/` out of the install tree** into `/opt/tplink/omada-rpi-upgrade/` (an instant `mv` on the same disk). Relocated directories are only unlinked — the data never leaves your SSD.
+4. **Runs the old version's `uninstall.sh`, then the new package's `install.sh`.** If the old version doesn't uninstall cleanly, your data is put straight back and nothing has changed.
+5. **Puts your data back** (as symlinks again if it was relocated), keeping any new top-level folders the new version created. Your existing database is never mixed with the fresh one.
+6. **Re-applies your memory profile and AppCDS** (TP-Link's installer overwrites `control.sh` and `omada.properties`), then **starts the controller**. The first start after an upgrade migrates the database and can take several minutes on a Pi — give it time before refreshing `https://<pi-ip>:8043`.
+
+If the upgrade is interrupted (power loss, network failure, new `install.sh` fails), your data stays safe in `/opt/tplink/omada-rpi-upgrade/`. Fix the problem and run `sudo bash install-raspberrypi.sh --upgrade` again from the new package folder: it notices the staged data and **resumes** rather than starting over.
+
+To change the memory profile during the upgrade, pass it: `--upgrade --profile oc300`. To turn on AppCDS at the same time, add `--fast-start`.
+
+### Rolling back
+
+If the new version misbehaves, go back to the old package with the pre-upgrade snapshot:
+
+```bash
+# from the OLD package folder (with this repo's scripts copied in)
+sudo bash uninstall-raspberrypi.sh -y            # removes the new version (relocated data is left alone)
+sudo bash install-raspberrypi.sh -y              # installs the old version (add --data-dir/--profile as before)
+sudo tpeap stop
+sudo find /opt/tplink/EAPController/data/ -mindepth 1 -delete
+sudo tar -xzf /opt/tplink/omada-rpi-backups/omada-data-<timestamp>.tar.gz -C /opt/tplink/EAPController/data/
+sudo tpeap start
+```
+
+(If your data was relocated, the snapshot is under `<data-disk>/omada-rpi-backups/`, and `data/` points at the data disk, so the commands above restore it in place.) Or install the old version fresh and restore the `.cfg` from the web UI.
+
+### Upgrading the rest of the stack
+
+- **Java / jsvc / libssl1.1** come from apt (or a `.deb`) and are updated with the rest of the system: `sudo apt update && sudo apt full-upgrade`. Restart Omada afterwards (`sudo tpeap restart`).
+- **MongoDB on a Pi 5** (official apt) gets **minor** updates with `apt full-upgrade`. A **major** MongoDB upgrade (e.g. 7.0 → 8.0) is a separate, one-major-at-a-time job with a `featureCompatibilityVersion` step — only do it when an Omada release needs it, after a UI backup.
+- **MongoDB on a Pi 4/3** (unofficial themattman build in `/usr/local/bin`) is never updated automatically. To move to a newer build of the **same** series, stop Omada, remove `/usr/local/bin/mongod`, and run `sudo MONGO_VERSION=7.0 bash install-raspberrypi.sh --deps-only`. Don't change major versions without a backup.
+- **This repo's scripts**: `git pull` before an upgrade so the new package gets the latest fixes.
+
+### Upgrading by hand (TP-Link's way)
+
+If you'd rather not use `--upgrade`: take the UI backup, then `sudo tpeap stop`, run `sudo bash /opt/tplink/EAPController/uninstall.sh` and answer **y** to keeping a database backup (saved to `/opt/tplink/omada_db_backup/`), then run `sudo bash install.sh` from the new package folder (answer **y** if it offers to restore that backup). Afterwards, re-run `--relocate-only --data-dir …` if you had relocated data (the old data on the other disk is still there and is kept), `--profile-only --profile <name>`, and `--optimize-only` to restore those tweaks.
 
 ---
 
@@ -116,7 +188,7 @@ By default the uninstaller only removes the Omada application (via TP-Link's own
 2. **Detects the board and CPU.** Reads `/proc/device-tree/model` and checks `/proc/cpuinfo` for the `atomics` (LSE) feature — present on ARMv8.2 (Pi 5), absent on ARMv8.0 (Pi 4/3) — to choose the MongoDB source and version.
 3. **Installs base packages:** the OS-appropriate JRE (`openjdk-17` or `openjdk-21`), `jsvc`, `curl`, `gnupg`, `ca-certificates`, and verifies Java is 17+.
 4. **Installs MongoDB.** On a Pi 5: imports the signing key **first**, then adds the official **Debian** `arm64` repo (component `main`; `bookworm` codename even on trixie) and installs `mongodb-org-server`. On a Pi 4/3: downloads the matching unofficial [themattman](https://github.com/themattman/mongodb-raspberrypi-binaries) `mongod` build into `/usr/local/bin` (or, with `MONGO_SOURCE=apt`, the official 4.4 repo).
-5. **Installs the runtime libraries the Pi 4 build needs, verified by running `mongod`.** It loops, fixing whatever the loader reports: OpenSSL 1.1 (`libcrypto.so.1.1`) via `libssl1.1` — auto-discovering the newest `arm64` `.deb` from the Debian pool — and, on older OSes like bullseye, a GCC 11+ `libstdc++` from [themattman](https://github.com/themattman/raspberrypi-binaries) (repointing `libstdc++.so.6`, recording the original for uninstall). The Pi 5 apt path uses `libssl3`/`libstdc++` from the OS and skips all of this.
+5. **Installs the runtime libraries the Pi 4 build needs, verified by running `mongod`.** It loops, fixing whatever the loader reports: OpenSSL 1.1 (`libcrypto.so.1.1`) via `libssl1.1` — from a `.deb` you supplied, apt, or the newest `arm64` build on `archive.debian.org` (see [below](#libssl11-on-bookworm--trixie--dietpi-pi-4)) — and, on older OSes like bullseye, a GCC 11+ `libstdc++` from [themattman](https://github.com/themattman/raspberrypi-binaries) (repointing `libstdc++.so.6`, recording the original for uninstall). The Pi 5 apt path uses `libssl3`/`libstdc++` from the OS and skips all of this.
 6. **Disables the distro `mongod.service`** (apt path only), because Omada launches and manages its *own* `mongod` on port `27217` with its own data dir.
 7. **Exports `JAVA_HOME` and hands off to `install.sh`** to install Omada and register the `tpeap` service. (Exporting `JAVA_HOME` keeps the stock installer's jsvc version-check from printing a harmless "Cannot locate Java Home".)
 8. **Relocates the writable data** (if you gave a `--data-dir` / answered the prompt) to that path and symlinks it back — see below.
@@ -169,7 +241,7 @@ Enable it at install time with `--fast-start`, or add it to an existing install 
 sudo bash install-raspberrypi.sh --optimize-only
 ```
 
-This appends the AppCDS flags to `control.sh`'s `JAVA_OPTS` (backing up the original as `control.sh.orig-omada-rpi`, idempotent), then restarts once to build the archive under `data/omada-app-cds.jsa` (on your SSD if you relocated data). The build restart itself isn't faster — the boot *after* it is. Because the flags live in `control.sh`, an Omada **upgrade overwrites them**; just re-run `--optimize-only` afterward.
+This appends the AppCDS flags to `control.sh`'s `JAVA_OPTS` (backing up the original as `control.sh.orig-omada-rpi`, idempotent), then restarts once to build the archive under `data/omada-app-cds.jsa` (on your SSD if you relocated data). The build restart itself isn't faster — the boot *after* it is. Because the flags live in `control.sh`, TP-Link's installer overwrites them on an upgrade — [`--upgrade`](#upgrading-omada-to-a-newer-release) puts them back for you (after a manual upgrade, re-run `--optimize-only`).
 
 Measure the effect from the log — Spring records its own startup time:
 
@@ -178,6 +250,31 @@ grep -iE 'Started .* in .* seconds' /opt/tplink/EAPController/logs/*.log
 ```
 
 Realistic expectation: AppCDS trims the class-loading portion (often ~20–40% of it), and moving `data/` to an SSD speeds MongoDB and the archive read — together a meaningful cut, but a big Spring app on a Pi won't become truly instant. Requires Java 19+ (so trixie's OpenJDK 21; on bookworm's OpenJDK 17 the script skips it with a notice).
+
+---
+
+## libssl1.1 on bookworm / trixie / DietPi (Pi 4)
+
+Only Pi 4/3 installs need this (the unofficial themattman MongoDB and official 4.4 are built against OpenSSL 1.1); a Pi 5 uses the system `libssl3`.
+
+`libssl1.1` was last shipped by Debian 11 *bullseye*. Bullseye is now end-of-life, so its packages are no longer on `deb.debian.org` / `security.debian.org` — they live on **`archive.debian.org`**. That's why older versions of this installer (and older guides) that fetched from `security.debian.org` now fail on fresh bookworm, trixie and DietPi systems.
+
+The installer tries, in order, and checks every `.deb` really is `libssl1.1` for `arm64` before installing it:
+
+1. A package you supply: `LIBSSL11_DEB=/path/to/file.deb` (or an `https://` URL), or any `libssl1.1_*_arm64.deb` placed **next to `install-raspberrypi.sh`**.
+2. Your configured apt sources (works on bullseye itself).
+3. The newest `libssl1.1` `arm64` build found in the Debian pools — `archive.debian.org/debian-security`, then `archive.debian.org/debian`, then the live mirrors.
+4. A pinned, known-good build: [`libssl1.1_1.1.1w-0+deb11u1_arm64.deb`](https://archive.debian.org/debian/pool/main/o/openssl/libssl1.1_1.1.1w-0+deb11u1_arm64.deb) (bullseye's final point release; override with `LIBSSL11_FALLBACK_URL=`).
+
+**Installing it yourself** (e.g. the Pi has no internet, or a proxy blocks `archive.debian.org`):
+
+```bash
+wget https://archive.debian.org/debian/pool/main/o/openssl/libssl1.1_1.1.1w-0+deb11u1_arm64.deb
+sudo dpkg -i libssl1.1_1.1.1w-0+deb11u1_arm64.deb
+# or drop the .deb next to install-raspberrypi.sh and just run the installer
+```
+
+`libssl1.1` installs alongside the system `libssl3` and doesn't replace it; only the MongoDB binary uses it. OpenSSL 1.1 is itself end-of-life upstream, which is one more reason a Pi 5 (system OpenSSL 3, official MongoDB) is the better long-term host.
 
 ---
 
@@ -193,7 +290,7 @@ Realistic expectation: AppCDS trims the class-loading portion (often ~20–40% o
 
 **Unofficial MongoDB won't run (Pi 4): `No ... build found` or a library error.** The GitHub lookup couldn't find a matching build, or the binary is missing a shared library. Browse [the releases](https://github.com/themattman/mongodb-raspberrypi-binaries/releases), pick an available series, and set `MONGO_VERSION=` (e.g. `6.0`). If `ldd $(command -v mongod)` shows a missing lib, install it or fall back to `MONGO_SOURCE=apt`.
 
-**`mongod: error while loading shared libraries: libcrypto.so.1.1` (Pi 4).** The themattman `mongod` is linked against OpenSSL 1.1, which bookworm/trixie replaced with OpenSSL 3. The installer fixes this automatically by adding `libssl1.1` (it provides `libcrypto.so.1.1` and `libssl.so.1.1`). To do it by hand: install `libssl1.1` (newest `arm64` `.deb` from the [Debian security pool](http://security.debian.org/debian-security/pool/updates/main/o/openssl/)), then re-run.
+**`mongod: error while loading shared libraries: libcrypto.so.1.1` (Pi 4).** The themattman `mongod` is linked against OpenSSL 1.1, which bookworm/trixie replaced with OpenSSL 3. The installer fixes this automatically by adding `libssl1.1` (it provides `libcrypto.so.1.1` and `libssl.so.1.1`). To do it by hand, see [libssl1.1 on bookworm / trixie / DietPi](#libssl11-on-bookworm--trixie--dietpi-pi-4), then re-run.
 
 **`... version 'GLIBCXX_3.4.29' not found` (Pi 4).** The unofficial `mongod` needs a GCC 11+ `libstdc++`; your OS (typically bullseye) is older. The installer detects this and installs [themattman's prebuilt `libstdc++`](https://github.com/themattman/raspberrypi-binaries/tree/main/libstdc%2B%2B) automatically, repointing `/lib/aarch64-linux-gnu/libstdc++.so.6` (a newer libstdc++ is backward-compatible, and the uninstaller restores the original). If you're doing it by hand, download the `.so` there and `ln -sf` it over `libstdc++.so.6`. Bookworm/trixie don't need this.
 
@@ -205,7 +302,9 @@ Realistic expectation: AppCDS trims the class-loading portion (often ~20–40% o
 
 **Omada won't start after enabling read-only root (relocated data).** Your data disk almost certainly isn't mounted at boot, so the `data`/`logs`/`work` symlinks point at nothing. Confirm the disk is in `/etc/fstab` and mounts before Omada starts (`findmnt /mnt/ssd/omada`), then `sudo tpeap start`.
 
-**`libssl1.1` couldn't be installed automatically (Pi 4 on bookworm/trixie).** Both the themattman builds and MongoDB 4.4 need `libssl1.1`, which modern Debian dropped; the installer normally pulls it from the Debian pool, but if that fails (network/mirror), grab the newest `libssl1.1` `arm64` `.deb` from the [Debian security pool](http://security.debian.org/debian-security/pool/updates/main/o/openssl/) and `sudo dpkg -i` it, then re-run. (A Pi 5 uses `libssl3` and avoids this entirely.)
+**`libssl1.1` couldn't be installed automatically (Pi 4 on bookworm/trixie/DietPi).** Both the themattman builds and MongoDB 4.4 need `libssl1.1`, which modern Debian dropped. The installer pulls it from `archive.debian.org`; if that's unreachable (no internet, proxy, firewall), download [`libssl1.1_1.1.1w-0+deb11u1_arm64.deb`](https://archive.debian.org/debian/pool/main/o/openssl/libssl1.1_1.1.1w-0+deb11u1_arm64.deb) on any machine, copy it next to `install-raspberrypi.sh` (or `sudo dpkg -i` it), then re-run. (A Pi 5 uses `libssl3` and avoids this entirely.)
+
+**`--upgrade` stopped part-way.** Your data is in `/opt/tplink/omada-rpi-upgrade/` (relocated data never moved) and there's a snapshot in `omada-rpi-backups/`. Fix the cause shown in the log, then run `sudo bash install-raspberrypi.sh --upgrade` again from the **new** package folder — it resumes. Don't delete `/opt/tplink/omada-rpi-upgrade/` by hand.
 
 ---
 
@@ -214,7 +313,7 @@ Realistic expectation: AppCDS trims the class-loading portion (often ~20–40% o
 - These scripts are tested for **syntax and logic** but the maintainer can't exercise every Pi-model / OS-version combination. PRs and issue reports with your board + OS + outcome are welcome.
 - The scripts are **version-agnostic** — they don't hard-code an Omada version and work with current v5.x/v6.x Linux packages. They rely on the stock `install.sh` being present in the same folder.
 - **On a Pi 4/3, the default MongoDB is an unofficial community build** ([themattman](https://github.com/themattman/mongodb-raspberrypi-binaries)) installed to `/usr/local/bin` and not managed by apt (no automatic security updates — update it by re-running or replacing the binary). The official alternative (`MONGO_SOURCE=apt`) is end-of-life MongoDB 4.4. Understand the trade-off; a Pi 5 runs official current MongoDB.
-- Always keep backups of your Omada configuration (Settings → Maintenance → Backup) before upgrading either Omada or MongoDB.
+- Always keep backups of your Omada configuration (Settings → Maintenance → Backup) before upgrading either Omada or MongoDB. See [Upgrading Omada](#upgrading-omada-to-a-newer-release).
 
 ---
 
