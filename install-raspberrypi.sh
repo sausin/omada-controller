@@ -59,9 +59,24 @@
 #   sudo bash install-raspberrypi.sh --profile-only --profile oc300
 #                                                        # (re)size an EXISTING install's memory
 #   sudo bash install-raspberrypi.sh --verbose           # stream all output instead of the clean checklist
+#   sudo bash install-raspberrypi.sh --no-systemd        # keep TP-Link's SysV 'tpeap' service only
+#   sudo bash install-raspberrypi.sh --skip-network-check
+#                                                        # don't check for a 192.168.0.x address
 #
-# Upgrading to a newer Omada release: extract the NEW TP-Link package, copy this
-# script into it, and run from there:
+# Helper commands: if omada-service.sh, omada-maintenance.sh and omada-network.sh
+# sit next to this script, they're installed to /usr/local/sbin (omada-service,
+# omada-maintenance, omada-network) and a native systemd unit is set up:
+#   sudo omada-service start|stop|restart|status|logs    # manage the controller
+#   sudo omada-maintenance update --latest               # versioned update, rollback-able
+#   omada-network suggest [--vlan ID]                    # reach factory-default devices
+#
+# Network check: new Omada devices sit on 192.168.0.0/24 and are found by broadcast.
+# If this Pi has no address there, the installer says so and, at the end, prints
+# the config (VLAN or second address) for this OS's network stack.
+#
+# Upgrading to a newer Omada release: `omada-maintenance update` (versioned, quick
+# rollback). Or the TP-Link way -- extract the NEW package, copy this script into it,
+# and run from there:
 #   sudo bash install-raspberrypi.sh --upgrade           # snapshot data, swap versions, restore data,
 #                                                        # re-apply profile + AppCDS (add -y to skip the prompt)
 #
@@ -180,7 +195,13 @@ render_summary(){
     say ""
     say "  ${GRN}${OKM} Setup complete${RST}"
     say "  ${DIM}────────────────────────────────────────────${RST}"
-    printf '  %s%-9s%s sudo tpeap start|stop|status\n' "$DIM" "Manage" "$RST"
+    if [ -x /usr/local/sbin/omada-service ]; then
+        printf '  %s%-9s%s sudo omada-service start|stop|restart|status|logs\n' "$DIM" "Manage" "$RST"
+    else
+        printf '  %s%-9s%s sudo tpeap start|stop|status\n' "$DIM" "Manage" "$RST"
+    fi
+    [ -x /usr/local/sbin/omada-maintenance ] && \
+        printf '  %s%-9s%s sudo omada-maintenance update --latest   (rollback: ... rollback)\n' "$DIM" "Update" "$RST"
     printf '  %s%-9s%s https://%s:8043\n' "$DIM" "Web UI" "$RST" "$ip"
     printf '  %s%-9s%s %s\n' "$DIM" "Profile" "$RST" "${PROFILE:-stock}"
     [ "${RELOCATE:-0}" = 1 ] && printf '  %s%-9s%s %s\n' "$DIM" "Data" "$RST" "$DATA_DEST"
@@ -199,6 +220,8 @@ PROFILE_ARG="${OMADA_PROFILE:-}"
 NEEDS_RESTART=0
 ASSUME_YES=0
 DATA_DIR_ARG="${OMADA_DATA_DIR:-}"
+NO_SYSTEMD=0
+SKIP_NETCHECK=0
 INSTALL_ARGS=()
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -212,6 +235,8 @@ while [ $# -gt 0 ]; do
         --profile=*)        PROFILE_ARG="${1#*=}" ;;
         --data-dir)         if [ $# -ge 2 ]; then shift; DATA_DIR_ARG="$1"; else warn "--data-dir needs a path"; fi ;;
         --data-dir=*)       DATA_DIR_ARG="${1#*=}" ;;
+        --no-systemd)       NO_SYSTEMD=1 ;;
+        --skip-network-check) SKIP_NETCHECK=1 ;;
         --verbose|-v)       VERBOSE=1 ;;
         --quiet|-q)         VERBOSE=0 ;;
         -y|-Y)              ASSUME_YES=1; INSTALL_ARGS+=("-y") ;;
@@ -695,9 +720,28 @@ resolve_data_dir() {
     fi
 }
 
+# Start/stop through systemd when omada-service.sh's unit is installed (so systemd
+# knows a stop is intentional), else straight through control.sh. A stop also goes
+# through control.sh in case the controller was started outside systemd.
+SYSTEMD_UNIT="/etc/systemd/system/tpeap.service"
+omada_unit(){ [ -f "$SYSTEMD_UNIT" ] && grep -q '^# Managed by omada-service' "$SYSTEMD_UNIT" && [ -d /run/systemd/system ]; }
+omada_ctl() {
+    case "$1" in
+        stop)    omada_unit && systemctl stop tpeap.service
+                 [ -x "$OMADA_CTL" ] && "$OMADA_CTL" stop ;;
+        start)   if omada_unit; then systemctl start tpeap.service; else "$OMADA_CTL" start; fi ;;
+        restart) omada_ctl stop; omada_ctl start ;;
+    esac
+}
+
+# Versioned layout from omada-maintenance.sh: EAPController -> omada/current, with
+# data/logs/work living in omada/shared.
+OMADA_ROOT="/opt/tplink/omada"
+is_versioned(){ [ -L "$INSTALL_BASE" ] && [ -d "${OMADA_ROOT}/shared" ]; }
+
 # Stop the controller and make sure its embedded mongod is really down.
 stop_omada() {
-    [ -x "$OMADA_CTL" ] && "$OMADA_CTL" stop >/dev/null 2>&1 || true
+    omada_ctl stop >/dev/null 2>&1 || true
     local i
     for i in $(seq 1 10); do
         pgrep -f "mongod.*27217" >/dev/null 2>&1 || break
@@ -718,6 +762,7 @@ relocate_omada_data() {
     local name src dst
     for name in data logs work; do
         src="${INSTALL_BASE}/${name}"
+        is_versioned && src="${OMADA_ROOT}/shared/${name}"   # shared by every release
         dst="${DATA_DEST}/${name}"
 
         if [ -L "$src" ]; then
@@ -743,7 +788,7 @@ relocate_omada_data() {
     chown -R "${u}:$(id -gn "$u" 2>/dev/null || echo root)" "$DATA_DEST" 2>/dev/null || true
 
     info "Starting Omada on the relocated data ..."
-    [ -x "$OMADA_CTL" ] && { "$OMADA_CTL" start || warn "Omada didn't report a clean start; check ${DATA_DEST}/logs."; }
+    [ -x "$OMADA_CTL" ] && { omada_ctl start || warn "Omada didn't report a clean start; check ${DATA_DEST}/logs."; }
     ok "Relocation complete: Omada now reads/writes under ${DATA_DEST}."
 }
 
@@ -917,9 +962,52 @@ restart_omada() {
     [ -x "$OMADA_CTL" ] || return 0
     if [ -n "$(pgrep -f com.tplink.smb.omada.starter.OmadaLinuxMain 2>/dev/null)" ]; then
         info "Restarting Omada once to apply the changes..."
-        "$OMADA_CTL" restart >/dev/null 2>&1 || warn "Restart reported an issue; check ${INSTALL_BASE}/logs/."
+        omada_ctl restart >/dev/null 2>&1 || warn "Restart reported an issue; check ${INSTALL_BASE}/logs/."
     else
-        "$OMADA_CTL" start >/dev/null 2>&1 || true
+        omada_ctl start >/dev/null 2>&1 || true
+    fi
+}
+
+# --- helper commands + systemd unit ---------------------------------------------
+# Installs the helper scripts that sit next to this one as /usr/local/sbin commands,
+# then (unless --no-systemd) the native systemd unit via `omada-service install`.
+HELPERS="omada-service omada-maintenance omada-network"
+have_helpers(){ local h; omada_unit && return 0; for h in $HELPERS; do [ -f "${SCRIPT_DIR}/${h}.sh" ] && return 0; done; return 1; }
+install_helpers() {
+    local h
+    for h in $HELPERS; do
+        [ -f "${SCRIPT_DIR}/${h}.sh" ] || continue
+        install -m 755 "${SCRIPT_DIR}/${h}.sh" "/usr/local/sbin/${h}" && ok "Installed /usr/local/sbin/${h}"
+    done
+    if [ "$NO_SYSTEMD" = 0 ] && [ -x /usr/local/sbin/omada-service ] && [ -d /run/systemd/system ]; then
+        /usr/local/sbin/omada-service install || warn "systemd unit setup reported an issue; 'tpeap' still works."
+    elif omada_unit; then
+        /usr/local/sbin/omada-service install >/dev/null 2>&1 || true   # refresh paths of an existing unit
+    fi
+    return 0
+}
+
+# --- network check (factory-default Omada devices live on 192.168.0.0/24) -------
+NET_OK=1
+network_precheck() {
+    [ "$SKIP_NETCHECK" = 1 ] && return 0
+    if [ -f "${SCRIPT_DIR}/omada-network.sh" ]; then
+        bash "${SCRIPT_DIR}/omada-network.sh" check --quiet && return 0
+    else
+        ip -4 -o addr show scope global 2>/dev/null | grep -q ' 192\.168\.0\.' && return 0
+    fi
+    NET_OK=0
+    say ""
+    warn "This Pi has no 192.168.0.x address -- the network new Omada devices come up on."
+    warn "The controller may not discover factory-default devices; suggested fix shown at the end."
+}
+network_advice() {
+    [ "$NET_OK" = 1 ] && return 0
+    if [ -f "${SCRIPT_DIR}/omada-network.sh" ]; then
+        bash "${SCRIPT_DIR}/omada-network.sh" suggest
+    else
+        say "  ${YLW}!${RST} No 192.168.0.x address: add one (or a VLAN interface) so new Omada devices are"
+        say "    discovered -- omada-network.sh from this repo prints the config for your OS.\n"
     fi
 }
 
@@ -1123,7 +1211,10 @@ if [ "$RELOCATE_ONLY" -eq 1 ]; then
     readonly_precheck
     resolve_data_dir
     STEP_TOTAL=$(( 2 + FAST_START ))
+    omada_unit && STEP_TOTAL=$((STEP_TOTAL+1))
     run_spin "Relocating data to ${DATA_DEST}" relocate_omada_data
+    # The unit's RequiresMountsFor= must follow the data to its new disk.
+    omada_unit && run_task "Updating systemd unit for the new data path" install_helpers
     [ "$FAST_START" -eq 1 ] && run_task "Enabling AppCDS fast start" optimize_startup_patch
     run_spin "Restarting controller" restart_omada
     render_summary
@@ -1133,6 +1224,8 @@ fi
 
 # --upgrade: move an existing install to the Omada version in this package dir.
 if [ "$UPGRADE" -eq 1 ]; then
+    is_versioned && die "This install uses versioned releases (omada-maintenance). Upgrade with:
+      sudo omada-maintenance update --file /path/to/Omada_..._linux_x64.tar.gz"
     [ -f "${SCRIPT_DIR}/install.sh" ] || die \
         "install.sh not found in ${SCRIPT_DIR}. Run --upgrade from inside the NEW extracted Omada package directory."
     RESUME=0
@@ -1165,6 +1258,7 @@ if [ "$UPGRADE" -eq 1 ]; then
     NEEDS_RESTART=1
     STEP_TOTAL=$(( 4 + FAST_START ))
     [ -n "$PROFILE_ARG" ] && STEP_TOTAL=$((STEP_TOTAL+1))
+    have_helpers && STEP_TOTAL=$((STEP_TOTAL+1))
     say ""
     run_spin "Installing prerequisites (Java, jsvc, curl)"         install_base_packages
     run_spin "Installing MongoDB ${MONGO_VERSION}"                 install_mongodb
@@ -1175,6 +1269,7 @@ if [ "$UPGRADE" -eq 1 ]; then
     fi
     [ -n "$PROFILE_ARG" ] && run_task "Applying ${PROFILE} memory profile" apply_profile
     [ "$FAST_START" = 1 ] && run_task "Enabling AppCDS fast start" optimize_startup_patch
+    have_helpers && run_task "Installing helper commands + systemd service" install_helpers
     run_spin "Starting controller (migrates the database)"        restart_omada
     render_summary
     [ -n "${UPG_SNAPSHOT:-}" ] && say "  ${DIM}Pre-upgrade snapshot: ${UPG_SNAPSHOT}"
@@ -1185,6 +1280,7 @@ fi
 # Full install: show context, gather all answers, then run the work quietly.
 render_context
 readonly_precheck
+network_precheck
 resolve_data_dir
 resolve_profile
 
@@ -1207,6 +1303,7 @@ STEP_TOTAL=3
 [ "$RELOCATE" = 1 ]   && STEP_TOTAL=$((STEP_TOTAL+1))
 STEP_TOTAL=$((STEP_TOTAL+1))                         # memory profile
 [ "$FAST_START" = 1 ] && STEP_TOTAL=$((STEP_TOTAL+1))
+have_helpers && STEP_TOTAL=$((STEP_TOTAL+1))
 STEP_TOTAL=$((STEP_TOTAL+1))                         # restart
 
 say ""
@@ -1219,6 +1316,7 @@ run_spin "Installing Omada controller (first boot ~1-3 min)"    run_stock_instal
 [ "$RELOCATE" = 1 ]   && run_spin "Relocating data to ${DATA_DEST}"   relocate_omada_data
 run_task "Applying ${PROFILE} memory profile"                   apply_profile
 [ "$FAST_START" = 1 ] && run_task "Enabling AppCDS fast start"  optimize_startup_patch
+have_helpers && run_task "Installing helper commands + systemd service" install_helpers
 run_spin "Restarting controller (applies settings)"             restart_omada
 
 render_summary
@@ -1226,3 +1324,4 @@ if [ "$RELOCATE" = 1 ]; then
     say "  ${DIM}Data is on a separate disk — you can now enable a read-only/overlay root."
     say "  Ensure ${DATA_DEST} is in /etc/fstab so it mounts before Omada starts.${RST}\n"
 fi
+network_advice

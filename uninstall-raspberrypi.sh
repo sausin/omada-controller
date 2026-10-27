@@ -29,6 +29,11 @@
 #   * curl, gnupg and ca-certificates are always left installed (too widely
 #     used to remove safely).
 #   * The system MongoDB data dir /var/lib/mongodb is never auto-deleted.
+#   * The systemd unit and helper commands from omada-service.sh /
+#     omada-maintenance.sh / omada-network.sh are removed with the app.
+#   * Versioned installs (omada-maintenance.sh): /opt/tplink/omada -- releases,
+#     the shared data and the database snapshots -- is left in place and reported;
+#     delete it yourself once you're sure you don't need the data.
 #   * JAVA_PKG=<pkg> overrides which Java package --remove-deps purges
 #     (default openjdk-17-jre-headless, matching the installer).
 #
@@ -59,7 +64,7 @@ for a in "$@"; do
         --remove-deps)    REMOVE_DEPS=1 ;;
         --purge-all)      REMOVE_MONGODB=1; REMOVE_DEPS=1 ;;
         -y|-Y)            ASSUME_YES=1 ;;
-        -h|--help)        sed -n '2,49p' "$0" | sed 's/^#\s\{0,1\}//'; exit 0 ;;
+        -h|--help)        sed -n '5,/^# -----/p' "$0" | sed '$d; s/^#\s\{0,1\}//'; exit 0 ;;
         *)                warn "Unknown argument '$a' ignored." ;;
     esac
 done
@@ -69,6 +74,24 @@ done
 
 SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
 INSTALLDIR="/opt/tplink/EAPController"
+
+# --- step 0: remove the systemd unit + helper commands -------------------------
+UNIT_FILE="/etc/systemd/system/tpeap.service"
+remove_service_and_helpers() {
+    if [ -f "$UNIT_FILE" ] && grep -q '^# Managed by omada-service' "$UNIT_FILE"; then
+        info "Removing the omada-service systemd unit..."
+        systemctl stop tpeap.service >/dev/null 2>&1 || true
+        systemctl disable tpeap.service >/dev/null 2>&1 || true
+        rm -f "$UNIT_FILE"
+        systemctl daemon-reload >/dev/null 2>&1 || true
+        ok "Removed ${UNIT_FILE}."
+    fi
+    local h
+    for h in omada-service omada-maintenance omada-network; do
+        [ -f "/usr/local/sbin/${h}" ] && rm -f "/usr/local/sbin/${h}" && ok "Removed /usr/local/sbin/${h}"
+    done
+    return 0
+}
 
 # --- step 1: remove the Omada application via the stock uninstaller -----------
 uninstall_omada_app() {
@@ -186,7 +209,13 @@ for _n in data logs work; do
     [ -L "$_p" ] && RELOCATED_TARGETS+=("${_n}/ -> $(readlink -f "$_p" 2>/dev/null)")
 done
 
+VERSIONED_ROOT=""
+[ -L "$INSTALLDIR" ] && [ -d /opt/tplink/omada/releases ] && VERSIONED_ROOT="/opt/tplink/omada"
+
+remove_service_and_helpers
 uninstall_omada_app
+# Stock uninstall removes the EAPController symlink; make sure nothing dangles.
+[ -n "$VERSIONED_ROOT" ] && [ -L "$INSTALLDIR" ] && rm -f "$INSTALLDIR"
 
 if [ "$REMOVE_MONGODB" -eq 1 ]; then
     echo
@@ -216,4 +245,9 @@ if [ "${#RELOCATED_TARGETS[@]}" -gt 0 ]; then
     echo "    Your data had been relocated to a separate disk and was NOT deleted:"
     for _t in "${RELOCATED_TARGETS[@]}"; do echo "      * ${_t}"; done
     echo "    Remove those paths manually if you no longer need the data."
+fi
+if [ -n "$VERSIONED_ROOT" ] && [ -d "$VERSIONED_ROOT" ]; then
+    echo "    Versioned releases, shared data and database snapshots were kept in:"
+    echo "      * ${VERSIONED_ROOT}   ($(du -sh "$VERSIONED_ROOT" 2>/dev/null | cut -f1))"
+    echo "    Remove it with 'sudo rm -rf ${VERSIONED_ROOT}' once you no longer need the data."
 fi

@@ -52,19 +52,19 @@ The installer detects your board's CPU capability and OS, then selects and insta
    cd Omada_Network_Application_v*_linux_x64
    ```
 
-3. **Drop the two scripts from this repo into that folder** (next to the stock `install.sh`):
+3. **Drop the scripts from this repo into that folder** (next to the stock `install.sh`):
    ```bash
    # e.g. clone this repo elsewhere and copy the scripts in:
-   cp /path/to/omada-raspberrypi/install-raspberrypi.sh   .
-   cp /path/to/omada-raspberrypi/uninstall-raspberrypi.sh .
+   cp /path/to/omada-raspberrypi/*.sh .
    ```
+   The installer also installs the three helpers (`omada-service.sh`, `omada-maintenance.sh`, `omada-network.sh`) as `/usr/local/sbin/omada-service`, `omada-maintenance` and `omada-network`, and sets up a [systemd service](#managing-the-service-systemd).
 
 4. **Run it:**
    ```bash
    sudo bash install-raspberrypi.sh
    ```
 
-The script installs OpenJDK 17, `jsvc`, `curl` and the correct MongoDB, then calls TP-Link's `install.sh` to install the controller and register it as a service. When it finishes, open:
+The script installs OpenJDK 17, `jsvc`, `curl` and the correct MongoDB, then calls TP-Link's `install.sh` to install the controller and register it as a service. Before it starts it checks the Pi has an address on `192.168.0.x`, the network new Omada devices come up on, and if it doesn't, it prints the config to add one at the end (see [Network](#network-reaching-new-omada-devices-1921680x--vlan)). When it finishes, open:
 
 ```
 https://<your-pi-ip>:8043
@@ -84,6 +84,8 @@ to complete the Omada setup wizard. (HTTP is on `:8088`, HTTPS on `:8043` by def
 | `sudo bash install-raspberrypi.sh --relocate-only --data-dir /mnt/ssd/omada` | Move an **existing** install's data to another disk; no (re)install |
 | `sudo bash install-raspberrypi.sh --optimize-only` | Add AppCDS faster boot to an **existing** install; nothing else |
 | `sudo bash install-raspberrypi.sh --upgrade` | Upgrade an **existing** install to the Omada version of the package this script is in — see [Upgrading Omada](#upgrading-omada-to-a-newer-release) |
+| `sudo bash install-raspberrypi.sh --no-systemd` | Don't install the native systemd unit; keep TP-Link's SysV `tpeap` service only |
+| `sudo bash install-raspberrypi.sh --skip-network-check` | Skip the `192.168.0.x` address check |
 | `sudo bash install-raspberrypi.sh init-cluster-mode` | Passed through to TP-Link's installer for cluster setups |
 | `sudo MONGO_VERSION=8.0 bash install-raspberrypi.sh` | Force a MongoDB version/series instead of auto-detecting |
 | `sudo MONGO_SOURCE=apt bash install-raspberrypi.sh` | On a Pi 4/3, use official MongoDB 4.4 instead of the unofficial modern build |
@@ -98,7 +100,119 @@ Run interactively (no flags) and the script asks two questions before doing any 
 
 ---
 
+## Managing the service (systemd)
+
+TP-Link's installer registers an old-style SysV script (`/etc/init.d/tpeap`). `omada-service` replaces it with a native systemd unit, `/etc/systemd/system/tpeap.service` (alias `omada.service`). Because a native unit takes the place of the generated one with the same name, the controller can never be started twice. The unit:
+
+- tracks the JVM through control.sh's PID file and **restarts it after a crash** (`Restart=on-failure`);
+- gives the first boot after an upgrade **20 minutes** to migrate the database before calling it failed;
+- waits for the disk that holds **relocated data** (`RequiresMountsFor=`), so a USB SSD that mounts late doesn't leave Omada with dangling symlinks;
+- calls `/opt/tplink/EAPController/bin/control.sh`, so it keeps working across upgrades and with versioned releases.
+
+The installer sets it up automatically. To add it to an existing install:
+
+```bash
+sudo bash omada-service.sh install       # writes + enables the unit, installs the `omada-service` command
+```
+
+Day to day:
+
+```bash
+sudo omada-service start | stop | restart
+sudo omada-service status                # systemd state + whether the web UI answers
+sudo omada-service logs                  # follow logs/server.log (Ctrl-C to quit)
+sudo omada-service enable | disable      # start at boot, or don't
+sudo omada-service uninstall             # remove the unit; `tpeap` takes over again
+```
+
+Plain `systemctl restart omada` works too. Avoid `tpeap stop`: it stops the process behind systemd's back.
+
+---
+
+## Updating with versioned releases (recommended)
+
+`omada-maintenance` keeps every Omada version in its own folder, keeps the data in one shared place, and makes `/opt/tplink/EAPController` a symlink to the active version:
+
+```
+/opt/tplink/
+  EAPController -> omada/current            # TP-Link's path: tpeap, init.d, the systemd unit all keep working
+  omada/
+    current  -> releases/6.0.0.24
+    previous -> releases/5.15.24.18         # what `rollback` returns to
+    releases/<version>/                     # bin lib properties …   data, logs, work -> ../../shared
+    shared/{data,logs,work}                 # or symlinks to your relocated data disk
+    snapshots/<time>__<from>__<to>/         # database copy taken at every switch
+```
+
+(With relocated data, snapshots go next to the data, e.g. `/mnt/ssd/omada/omada-snapshots/`.)
+
+```bash
+sudo omada-maintenance check                              # installed vs. newest on TP-Link's site
+sudo omada-maintenance update --latest                    # find, download, prepare, switch
+sudo omada-maintenance update --file ~/Omada_Network_Application_v6.0.0.24_linux_x64.tar.gz
+sudo omada-maintenance update --url https://static.tp-link.com/…/….tar.gz --sha256 <hash>
+sudo omada-maintenance status                             # releases, snapshots, health
+sudo omada-maintenance rollback                           # back to `previous`, database included
+```
+
+**How close to zero downtime it gets.** An update runs in two phases:
+
+1. **Prepare. The controller keeps running.** The script downloads and checks the package, unpacks it into `releases/<version>`, links it to the shared data and carries your settings over: the memory profile and AppCDS lines in `control.sh`, and the `omada.properties` values you or the installer changed (ports, MongoDB cache, `max.device`). It does not run TP-Link's `install.sh`.
+2. **Switch. This is the only downtime.** Stop, snapshot the database, atomically flip `current`, start, then wait until the web UI answers. Downtime is one stop plus one start, a few minutes on a Pi, and the script prints how long it was.
+
+True zero downtime isn't possible. Omada runs a single MongoDB on its data, and the new version migrates that database on first start, so the two versions can't run side by side. During the switch your **APs, switches and gateways keep forwarding traffic**; only management, statistics and captive portal pause.
+
+Useful options for `update`:
+
+| Option | Effect |
+|---|---|
+| `--prepare-only` | Do phase 1 now; switch later (e.g. at night) with `sudo omada-maintenance switch <version>` |
+| `--auto-rollback` | If the new version doesn't answer within 15 min (`OMADA_HEALTH_TIMEOUT`), roll back automatically |
+| `-y` | No prompts |
+| `--no-snapshot` | Skip the database copy (faster, but rollback can't restore the database) |
+| `--name <ver>` | Release name, if the version can't be read from the file name |
+| `--force` | Rebuild an already-prepared release, or allow a downgrade |
+
+**Rollback** points `current` back at `previous` **and restores the database snapshot** taken when you left that version. This matters because the old version can't read a database the new one has migrated. Changes made in the web UI after the switch are lost, and the database you abandoned is kept under `snapshots/…__abandoned`. `rollback <version>` goes back to any release still on disk. Use `--keep-data` to skip the restore when you know the versions share a database format.
+
+**First run.** The first `update` converts a classic install (made by `install-raspberrypi.sh` or TP-Link's own `install.sh`) into this layout during the switch, so there's no extra restart. Run `sudo omada-maintenance adopt` to convert it on its own. Relocated data stays where it is.
+
+**Housekeeping.** After each successful update, the newest 3 releases and snapshots are kept (`OMADA_KEEP`). `current`, `previous` and the snapshot that `rollback` needs are never deleted. Run `sudo omada-maintenance prune --keep N` to trim by hand. Each snapshot is a full copy of `data/`; on btrfs/XFS it's an instant reflink copy.
+
+**`--latest`** reads TP-Link's download page for the newest Linux `.tar.gz` (`OMADA_DOWNLOAD_PAGE` changes the page). If TP-Link changes the page layout it may stop finding anything; then download the file yourself and use `--file`. Only `https://` URLs are accepted, and `--sha256` checks the file before anything is unpacked.
+
+> Read the release notes before a big jump (e.g. 4.x → 5.x). If TP-Link requires an intermediate version, update to that first. If a release's `install.sh` does more than copy files, which is rare, use the TP-Link-style `--upgrade` below for that one step.
+
+---
+
+## Network: reaching new Omada devices (192.168.0.x / VLAN)
+
+Factory-default Omada gear lives on **192.168.0.0/24**. A gateway such as the ER605 hands out that subnet from `192.168.0.1`, and APs and switches without a DHCP lease fall back to `192.168.0.254`. The controller finds new devices with a **broadcast** on that segment (UDP 29810). If the Pi only has an address in another subnet, say your home LAN on `10.0.0.x`, it won't see them until each one is pointed at the controller by hand (Discovery Utility, DHCP option 138, or the device's inform URL).
+
+The fix is to give the Pi a **second address** in `192.168.0.0/24` with no gateway, so normal routing is untouched. Put it on the same cable, or on a **VLAN interface** if your Omada devices are on a tagged management VLAN. The installer checks for this, and `omada-network` prints the exact config for the network stack your OS uses:
+
+```bash
+omada-network check                       # is there a 192.168.0.x address?
+omada-network suggest                     # second address on the same (untagged) LAN
+omada-network suggest --vlan 10           # VLAN interface eth0.10 with 192.168.0.250/24
+sudo omada-network apply-temp --vlan 10   # try it now; gone after reboot (remove-temp to undo)
+```
+
+| OS / setup | Network stack detected | What it suggests |
+|---|---|---|
+| Ubuntu (server & desktop) | **netplan** | `/etc/netplan/60-omada.yaml` (`vlans:` or extra `addresses:`), applied with `netplan try`, which reverts by itself if you lose access |
+| Raspberry Pi OS bookworm+, Debian/Ubuntu desktop, many Arch installs | **NetworkManager** | `nmcli con add type vlan …` or `nmcli con mod … +ipv4.addresses` |
+| Arch, minimal Debian | **systemd-networkd** | `.netdev` + `.network` for the VLAN plus a drop-in on your existing `.network` file |
+| Debian server | **ifupdown** (`/etc/network/interfaces`) | `interfaces.d/` stanza with `vlan-raw-device` (needs the `vlan` package) |
+| Raspberry Pi OS bullseye and older | **dhcpcd** | ifupdown VLAN + `dhcpcd.conf` static, or a small systemd unit |
+
+Options: `--ip 192.168.0.250/24` (the default sits outside the gateway's default DHCP pool and avoids `.1` and `.254`), `--iface eth0`, `--manager <name>` to show another stack's config. For a VLAN, the switch port the Pi is plugged into must carry that VLAN **tagged**. Once your devices are adopted and moved onto your own network, you can remove the extra address. Nothing is written to your network config; the script only prints suggestions, plus the optional `apply-temp`.
+
+---
+
 ## Upgrading Omada to a newer release
+
+> **Prefer [`omada-maintenance update`](#updating-with-versioned-releases-recommended)**: it switches versions with minimal downtime and rolls back in one command. The `--upgrade` flow below is TP-Link's uninstall-then-reinstall path, kept for classic (non-versioned) installs. On a versioned install, `--upgrade` refuses and points you to `omada-maintenance`.
 
 TP-Link ships new Omada Network Application releases (formerly *Omada SDN Controller*) as a fresh Linux `.tar.gz`. There's no in-place updater for the tar.gz install: TP-Link's supported path is *uninstall the old version, install the new one, let it migrate the database*. Doing that by hand on a Pi set up with this project would also throw away what the installer layered on top — the relocated `data`/`logs`/`work` symlinks, the memory profile and AppCDS — and leave you trusting the stock uninstaller's database backup. `--upgrade` does the whole thing safely in one command.
 
@@ -178,7 +292,7 @@ sudo bash uninstall-raspberrypi.sh --remove-deps    # also purge Java + jsvc
 sudo bash uninstall-raspberrypi.sh --purge-all      # app + MongoDB + Java + jsvc
 ```
 
-By default the uninstaller only removes the Omada application (via TP-Link's own `uninstall.sh`) and leaves the system packages alone, since Java/`curl`/MongoDB may be used by other things on the box. Package removal is opt-in via the flags above. `curl`, `gnupg` and `ca-certificates` are always kept, and the system MongoDB data dir `/var/lib/mongodb` is never auto-deleted. If TP-Link's uninstaller kept a database backup, it points you to `/opt/tplink/omada_db_backup/omada.db.tar.gz`.
+The uninstaller also removes the `omada-service` systemd unit and the helper commands. On a versioned install it leaves `/opt/tplink/omada` (releases, shared data, snapshots) in place and tells you, so you decide when the data goes. By default the uninstaller only removes the Omada application (via TP-Link's own `uninstall.sh`) and leaves the system packages alone, since Java/`curl`/MongoDB may be used by other things on the box. Package removal is opt-in via the flags above. `curl`, `gnupg` and `ca-certificates` are always kept, and the system MongoDB data dir `/var/lib/mongodb` is never auto-deleted. If TP-Link's uninstaller kept a database backup, it points you to `/opt/tplink/omada_db_backup/omada.db.tar.gz`.
 
 ---
 
@@ -303,6 +417,10 @@ sudo dpkg -i libssl1.1_1.1.1w-0+deb11u1_arm64.deb
 **Omada won't start after enabling read-only root (relocated data).** Your data disk almost certainly isn't mounted at boot, so the `data`/`logs`/`work` symlinks point at nothing. Confirm the disk is in `/etc/fstab` and mounts before Omada starts (`findmnt /mnt/ssd/omada`), then `sudo tpeap start`.
 
 **`libssl1.1` couldn't be installed automatically (Pi 4 on bookworm/trixie/DietPi).** Both the themattman builds and MongoDB 4.4 need `libssl1.1`, which modern Debian dropped. The installer pulls it from `archive.debian.org`; if that's unreachable (no internet, proxy, firewall), download [`libssl1.1_1.1.1w-0+deb11u1_arm64.deb`](https://archive.debian.org/debian/pool/main/o/openssl/libssl1.1_1.1.1w-0+deb11u1_arm64.deb) on any machine, copy it next to `install-raspberrypi.sh` (or `sudo dpkg -i` it), then re-run. (A Pi 5 uses `libssl3` and avoids this entirely.)
+
+**New Omada devices don't show up for adoption.** The controller probably isn't on their `192.168.0.x` segment. Run `omada-network suggest` (add `--vlan <ID>` for a tagged management VLAN) and see [Network](#network-reaching-new-omada-devices-1921680x--vlan).
+
+**`omada-maintenance update` says the new version didn't come up.** Look at `sudo omada-service logs`. A database migration on a Pi can take a long time, so raise `OMADA_HEALTH_TIMEOUT` (seconds) if it was still migrating. `sudo omada-maintenance rollback` returns to the previous release and database. If the update was interrupted mid-switch, `omada-maintenance status` shows which release is active, and `switch` or `rollback` finishes the job.
 
 **`--upgrade` stopped part-way.** Your data is in `/opt/tplink/omada-rpi-upgrade/` (relocated data never moved) and there's a snapshot in `omada-rpi-backups/`. Fix the cause shown in the log, then run `sudo bash install-raspberrypi.sh --upgrade` again from the **new** package folder — it resumes. Don't delete `/opt/tplink/omada-rpi-upgrade/` by hand.
 
